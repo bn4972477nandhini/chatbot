@@ -6,12 +6,28 @@ const { configError } = require("../lib/errors");
 let client = null;
 
 /**
- * Single shared OpenAI client for the whole app — embeddings and chat both use
- * it, so connections and keep-alive sockets are reused rather than rebuilt per
+ * Single shared client for the whole app — embeddings and chat both use it, so
+ * connections and keep-alive sockets are reused rather than rebuilt per
  * request. Built lazily so the server still boots without credentials.
+ *
+ * Doubles as the Ollama client: Ollama exposes an OpenAI-compatible surface
+ * (/v1/chat/completions, /v1/embeddings), so pointing the same `openai` SDK at
+ * its base URL is enough — no separate client implementation needed. Ollama
+ * does not check the API key, so a placeholder is used.
  */
 function getOpenAIClient() {
   if (client) return client;
+
+  if (config.llm.provider === "ollama") {
+    client = new OpenAI({
+      apiKey: "ollama",
+      baseURL: config.llm.baseUrl,
+      timeout: config.llm.timeoutMs,
+      maxRetries: 0,
+    });
+
+    return client;
+  }
 
   if (!config.openai.apiKey) {
     throw configError("OPENAI_API_KEY is not set. Add it to .env before using the API.");

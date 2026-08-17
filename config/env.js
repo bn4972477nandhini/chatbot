@@ -39,7 +39,16 @@ function readString(name, fallback) {
   return raw === undefined || raw === "" ? fallback : raw;
 }
 
+const LLM_PROVIDERS = ["openai", "ollama"];
+
 function buildConfig() {
+  const llmProvider = readString("LLM_PROVIDER", "openai");
+  if (!LLM_PROVIDERS.includes(llmProvider)) {
+    throw new Error(
+      `LLM_PROVIDER must be one of ${LLM_PROVIDERS.join(", ")}, received "${llmProvider}".`
+    );
+  }
+
   const config = {
     nodeEnv: readString("NODE_ENV", "development"),
     port: readInt("PORT", 3000, { min: 1, max: 65535 }),
@@ -53,6 +62,18 @@ function buildConfig() {
       embeddingDimensions: readInt("EMBEDDING_DIMENSIONS", 1536, { min: 1, max: 8192 }),
       temperature: readFloat("CHAT_TEMPERATURE", 0.2, { min: 0, max: 2 }),
       timeoutMs: readInt("OPENAI_TIMEOUT_MS", 60_000, { min: 1_000, max: 600_000 }),
+    },
+
+    // Local, no-API-key alternative to OpenAI. Ollama exposes an OpenAI-compatible
+    // HTTP surface (/v1/chat/completions, /v1/embeddings), so the same `openai`
+    // SDK client works against it — only the base URL and model names differ.
+    ollama: {
+      baseUrl: readString("OLLAMA_BASE_URL", "http://localhost:11434"),
+      llmModel: readString("OLLAMA_LLM_MODEL", "llama3.2"),
+      embeddingModel: readString("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
+      // nomic-embed-text produces 768-dim vectors.
+      embeddingDimensions: readInt("OLLAMA_EMBEDDING_DIMENSIONS", 768, { min: 1, max: 8192 }),
+      timeoutMs: readInt("OLLAMA_TIMEOUT_MS", 120_000, { min: 1_000, max: 600_000 }),
     },
 
     qdrant: {
@@ -92,6 +113,25 @@ function buildConfig() {
     throw new Error("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.");
   }
 
+  // Effective, provider-resolved values. embeddingService.js and chatService.js
+  // read from here rather than from `openai`/`ollama` directly, so the rest of
+  // the pipeline does not need to know which provider is active.
+  config.llm = {
+    provider: llmProvider,
+    chatModel: llmProvider === "ollama" ? config.ollama.llmModel : config.openai.chatModel,
+    embeddingModel:
+      llmProvider === "ollama" ? config.ollama.embeddingModel : config.openai.embeddingModel,
+    embeddingDimensions:
+      llmProvider === "ollama"
+        ? config.ollama.embeddingDimensions
+        : config.openai.embeddingDimensions,
+    temperature: config.openai.temperature,
+    timeoutMs: llmProvider === "ollama" ? config.ollama.timeoutMs : config.openai.timeoutMs,
+    // Ollama's OpenAI-compatible surface lives under /v1. Left undefined for the
+    // real OpenAI provider so the SDK uses its own default.
+    baseUrl: llmProvider === "ollama" ? `${config.ollama.baseUrl}/v1` : undefined,
+  };
+
   return config;
 }
 
@@ -106,7 +146,10 @@ const config = buildConfig();
  */
 function missingCredentials() {
   const missing = [];
-  if (!config.openai.apiKey) missing.push("OPENAI_API_KEY");
+  // The local Ollama provider needs no API key at all.
+  if (config.llm.provider === "openai" && !config.openai.apiKey) {
+    missing.push("OPENAI_API_KEY");
+  }
   if (!config.qdrant.url) missing.push("QDRANT_URL");
   return missing;
 }

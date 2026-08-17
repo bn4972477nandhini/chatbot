@@ -8,8 +8,8 @@ const {
   NO_ANSWER_REPLY,
 } = require("./promptService");
 
-const CHAT_MODEL = config.openai.chatModel;
-const TEMPERATURE = config.openai.temperature;
+const CHAT_MODEL = config.llm.chatModel;
+const TEMPERATURE = config.llm.temperature;
 
 /**
  * Builds the chat service. Dependencies are injected with real defaults so the

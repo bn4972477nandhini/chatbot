@@ -2,10 +2,11 @@
 
 A retrieval-augmented chatbot that answers questions **only** from `uploads/founder.pdf`. The PDF is
 chunked and embedded into Qdrant; each question is embedded, matched against those vectors, and
-answered by an OpenAI chat model constrained to the retrieved passages. If the answer isn't in the
-book, it says so rather than guessing.
+answered by a chat model constrained to the retrieved passages. If the answer isn't in the book, it
+says so rather than guessing.
 
-- **Backend** — Node.js + Express 5, OpenAI embeddings, Qdrant vector store
+- **Backend** — Node.js + Express 5, Qdrant vector store
+- **LLM provider** — pluggable: **Ollama** (local, free, default — no API key) or **OpenAI**
 - **Frontend** — React 19 + TypeScript + Vite + Tailwind v4
 - **Single-turn** — no conversation memory, no streaming, no auth
 
@@ -30,8 +31,10 @@ book, it says so rather than guessing.
 ## Requirements
 
 - **Node.js 20+** (uses the built-in test runner and `AbortSignal.any`)
-- An **OpenAI API key**
 - A **Qdrant** instance — local via Docker, or Qdrant Cloud
+- An LLM provider — either:
+  - **Ollama**, running locally (default, free, no API key), or
+  - An **OpenAI API key**, if you set `LLM_PROVIDER=openai`
 
 ---
 
@@ -51,7 +54,9 @@ Then create your environment file:
 cp .env.example .env
 ```
 
-Fill in `OPENAI_API_KEY` and `QDRANT_URL`. Everything else has a working default.
+The example file ships with `LLM_PROVIDER=ollama` — fill in `QDRANT_URL` and you're done. Everything
+else has a working default. Switch `LLM_PROVIDER=openai` and fill in `OPENAI_API_KEY` instead if you'd
+rather use OpenAI.
 
 > **Note on `.npmrc`** — the repo sets `legacy-peer-deps=true`. `@langchain/community` declares a
 > hard peer on `@browserbasehq/stagehand`, which pins `openai@^4` and `dotenv@^16`, far behind what
@@ -63,19 +68,78 @@ Need a local Qdrant?
 docker run -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
 ```
 
+(No Docker? A native Windows/Linux/macOS binary is published on the
+[Qdrant releases page](https://github.com/qdrant/qdrant/releases) — download it and run
+`qdrant.exe` / `./qdrant` directly; it listens on `:6333` with no further setup.)
+
+---
+
+## Running fully locally with Ollama (Windows)
+
+This is the zero-cost, zero-API-key path — everything runs on your machine.
+
+**1. Install Ollama.**
+
+```powershell
+winget install Ollama.Ollama
+```
+
+(Or download the installer from [ollama.com/download](https://ollama.com/download).) Installing it
+also starts a background service listening on `http://localhost:11434`.
+
+**2. Pull the two models this project uses.**
+
+```powershell
+ollama pull llama3.2          # chat model, ~2GB
+ollama pull nomic-embed-text  # embedding model, ~275MB
+```
+
+**3. Confirm Ollama is reachable.**
+
+```powershell
+curl http://localhost:11434/api/version
+```
+
+**4. Set your `.env`.** `.env.example` already defaults to this setup:
+
+```
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_LLM_MODEL=llama3.2
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_EMBEDDING_DIMENSIONS=768
+QDRANT_URL=http://localhost:6333
+```
+
+No `OPENAI_API_KEY` needed — `missingCredentials()` in `config/env.js` only requires it when
+`LLM_PROVIDER=openai`.
+
+**5. Start Qdrant, then the app**, as described in [Running](#running). Index the book, then chat —
+same `/index-book` and `/chat` endpoints either way; only the provider behind them changed.
+
+Want a stronger model and have the RAM for it? `ollama pull llama3.1:8b` and set
+`OLLAMA_LLM_MODEL=llama3.1:8b`. Any model pulled into Ollama works — the chat quality/speed tradeoff
+is yours to make.
+
 ---
 
 ## Environment variables
 
-Only the first two are required. All values are validated at boot — a malformed number or an
-out-of-range value fails immediately with a precise message rather than at first request.
+`QDRANT_URL` is always required. `OPENAI_API_KEY` is only required when `LLM_PROVIDER=openai`. All
+values are validated at boot — a malformed number or an out-of-range value fails immediately with a
+precise message rather than at first request.
 
 ### Required
 
 | Variable | Description |
 | --- | --- |
-| `OPENAI_API_KEY` | OpenAI key used for embeddings and chat completions |
 | `QDRANT_URL` | e.g. `http://localhost:6333`, or `http://qdrant:6333` under compose |
+
+### LLM provider
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LLM_PROVIDER` | `openai`* | `ollama` or `openai`. *`.env.example` ships with `ollama`. |
 
 ### Qdrant
 
@@ -85,22 +149,38 @@ out-of-range value fails immediately with a precise message rather than at first
 | `QDRANT_COLLECTION` | `founder_book` | Collection name |
 | `QDRANT_TIMEOUT_MS` | `20000` | Per-request timeout |
 
-### Models
+### Models — Ollama (`LLM_PROVIDER=ollama`)
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama's HTTP API; `/v1` is appended automatically |
+| `OLLAMA_LLM_MODEL` | `llama3.2` | Chat model — must be `ollama pull`ed first |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model — must be `ollama pull`ed first |
+| `OLLAMA_EMBEDDING_DIMENSIONS` | `768` | Must match the model; changing it requires a fresh collection |
+| `OLLAMA_TIMEOUT_MS` | `120000` | Per-request timeout — local inference is slower than a hosted API |
+
+### Models — OpenAI (`LLM_PROVIDER=openai`)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | — | Required for this provider |
 | `CHAT_MODEL` | `gpt-5.5` | Chat completion model |
-| `CHAT_TEMPERATURE` | `0.2` | See the note in [Troubleshooting](#troubleshooting) |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
 | `EMBEDDING_DIMENSIONS` | `1536` | Must match the model; changing it requires a fresh collection |
 | `OPENAI_TIMEOUT_MS` | `60000` | Per-request timeout |
+
+### Shared
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CHAT_TEMPERATURE` | `0.2` | Applies to whichever provider is active. See [Troubleshooting](#troubleshooting) |
 
 ### Retrieval
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RETRIEVAL_TOP_K` | `5` | Chunks passed to the model |
-| `RETRIEVAL_SCORE_THRESHOLD` | `0.65` | Minimum cosine score; below this a chunk is discarded |
+| `RETRIEVAL_SCORE_THRESHOLD` | `0.65`* | Minimum cosine score; below this a chunk is discarded. *`.env.example` ships `0.55`, tuned for Ollama's `nomic-embed-text` — see the comment there. `0.65` (this code default) fits OpenAI's `text-embedding-3-small` better. |
 | `RETRIEVAL_USE_MMR` | `true` | Diversity re-ranking (see [How retrieval works](#how-retrieval-works)) |
 | `RETRIEVAL_MMR_LAMBDA` | `0.7` | `1.0` = pure relevance, `0.0` = pure diversity |
 | `RETRIEVAL_MMR_POOL_MULTIPLIER` | `4` | Candidate pool = `topK × this`, capped at 100 |
@@ -295,7 +375,7 @@ by adding CORS to the API.
 │   ├── errors.js           AppError with HTTP status and client-safe messages
 │   └── logger.js           Structured JSON logging with redaction
 ├── services/
-│   ├── openaiClient.js     Single shared OpenAI client
+│   ├── openaiClient.js     Shared client — OpenAI, or Ollama via its OpenAI-compatible API
 │   ├── pdfReader.js        PDF → text (async, non-blocking)
 │   ├── chunkService.js     Text → overlapping chunks
 │   ├── embeddingService.js Batching, retry, query cache
@@ -326,8 +406,8 @@ The layering rule: **routes are thin, components are presentational**. Business 
 
 ## How retrieval works
 
-1. The question is embedded (`text-embedding-3-small`, 1536 dimensions). Repeat questions are served
-   from a small in-process LRU cache, avoiding a paid round trip.
+1. The question is embedded (`nomic-embed-text`/768 dims on Ollama, or `text-embedding-3-small`/1536
+   dims on OpenAI). Repeat questions are served from a small in-process LRU cache.
 2. Qdrant returns a candidate pool — `topK × 4` when MMR is enabled, `topK` otherwise — filtered by
    `scoreThreshold`.
 3. **MMR** re-ranks that pool down to `topK`. With 200 characters of overlap between neighbouring
@@ -354,12 +434,21 @@ are created with the collection so filters use an index rather than a scan.
 **`/health` reports `degraded`** — check `config` (missing credentials) and `qdrant` (unreachable)
 in the response body.
 
-**Model rejects `temperature`** — some newer OpenAI models accept only their default temperature and
-return a 400 for an explicit value. The service detects that specific error, retries once without
-the parameter, and logs a warning; all other errors propagate. If this happens, answers use the model
-default rather than `0.2`.
+**Model rejects `temperature`** (OpenAI only) — some newer OpenAI models accept only their default
+temperature and return a 400 for an explicit value. The service detects that specific error, retries
+once without the parameter, and logs a warning; all other errors propagate. If this happens, answers
+use the model default rather than `0.2`.
 
-**`model_not_found` for `gpt-5.5`** — set `CHAT_MODEL` in `.env` to a model your account can access.
+**`model_not_found` for `gpt-5.5`** (OpenAI only) — set `CHAT_MODEL` in `.env` to a model your account
+can access.
+
+**`/chat` or `/index-book` fails with a connection error to `localhost:11434`** (Ollama) — Ollama
+isn't running. Check `curl http://localhost:11434/api/version`; if that fails, start Ollama (the
+winget install runs it as a background service, so check the Ollama tray icon, or run `ollama serve`
+manually).
+
+**`model not found` from Ollama** — the model in `OLLAMA_LLM_MODEL` / `OLLAMA_EMBEDDING_MODEL` hasn't
+been pulled yet. Run `ollama pull <model>` and `ollama list` to confirm.
 
 **A new route 404s** — a stale server may still hold port 3000. `setInterval` keeps the process alive
 past a closed shell. Check for listeners on 3000 and kill them.

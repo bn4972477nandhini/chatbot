@@ -2,8 +2,8 @@ const { config } = require("../config/env");
 const { AppError, upstreamError } = require("../lib/errors");
 const { getOpenAIClient } = require("./openaiClient");
 
-const EMBEDDING_MODEL = config.openai.embeddingModel;
-const EMBEDDING_DIMENSIONS = config.openai.embeddingDimensions;
+const EMBEDDING_MODEL = config.llm.embeddingModel;
+const EMBEDDING_DIMENSIONS = config.llm.embeddingDimensions;
 
 // The embeddings endpoint accepts many inputs per call. Keeping batches modest
 // stays well inside the per-request token ceiling for 1000-char chunks.
