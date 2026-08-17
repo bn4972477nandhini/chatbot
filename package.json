@@ -1,0 +1,35 @@
+{
+  "name": "chatbot",
+  "version": "1.0.0",
+  "description": "RAG chatbot answering questions from the Founder Book",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test --require ./tests/setup-env.js \"tests/**/*.test.js\"",
+    "test:unit": "node --test --require ./tests/setup-env.js \"tests/unit/*.test.js\"",
+    "test:integration": "node --test --require ./tests/setup-env.js \"tests/integration/*.test.js\"",
+    "test:api": "node --test --require ./tests/setup-env.js \"tests/api/*.test.js\"",
+    "test:watch": "node --test --watch --require ./tests/setup-env.js \"tests/**/*.test.js\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@langchain/community": "^0.3.36",
+    "@langchain/core": "^1.2.5",
+    "@qdrant/js-client-rest": "^1.19.0",
+    "compression": "^1.8.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.6.2",
+    "helmet": "^8.3.0",
+    "langchain": "^0.3.27",
+    "openai": "^7.4.0",
+    "pdfjs-dist": "^4.10.38"
+  }
+}
