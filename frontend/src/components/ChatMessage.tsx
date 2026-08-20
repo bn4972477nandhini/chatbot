@@ -1,14 +1,22 @@
 import { memo, lazy, Suspense } from "react";
 import { CopyButton } from "./CopyButton";
 import { formatFullTime, formatTime } from "../utils/formatTime";
-import type { Message } from "../types/chat";
+import type { Citation, Message } from "../types/chat";
 
 // The Markdown renderer is only needed once an assistant answer exists, so it is
 // split out of the initial bundle — the empty state and input ship without it.
 const Markdown = lazy(() => import("./Markdown"));
 
-/** Small badges listing the chunks an answer drew from. */
-function Sources({ citations }: { citations: { chunkId: number; score: number }[] }) {
+function pageLabel(citation: Citation): string {
+  if (citation.page == null) return "";
+  if (citation.pageEnd != null && citation.pageEnd !== citation.page) {
+    return ` · p.${citation.page}-${citation.pageEnd}`;
+  }
+  return ` · p.${citation.page}`;
+}
+
+/** Small badges listing the chunks (and pages) an answer drew from. */
+function Sources({ citations }: { citations: Citation[] }) {
   if (citations.length === 0) return null;
 
   return (
@@ -24,6 +32,7 @@ function Sources({ citations }: { citations: { chunkId: number; score: number }[
               className="inline-flex items-center rounded-md bg-indigo-50 px-2 py-1 text-[0.7rem] font-medium text-indigo-700 ring-1 ring-indigo-100 ring-inset"
             >
               Chunk {citation.chunkId}
+              {pageLabel(citation)}
             </span>
           </li>
         ))}

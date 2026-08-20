@@ -5,11 +5,13 @@ const { createChatService } = require("../../services/chatService");
 const { NO_ANSWER_REPLY } = require("../../services/promptService");
 const { createMockOpenAI, createTestLogger } = require("../helpers/mocks");
 
-const chunk = (chunkId, score) => ({
+const chunk = (chunkId, score, page = chunkId) => ({
   chunkId,
   score,
   pageContent: `content ${chunkId}`,
   source: "Founder.pdf",
+  page,
+  pageEnd: page,
 });
 
 function build({ chunks = [chunk(12, 0.92)], client } = {}) {
@@ -42,8 +44,8 @@ describe("chatService", () => {
     const { citations } = await service.ask("q");
 
     assert.deepEqual(citations, [
-      { chunkId: 12, score: 0.92 },
-      { chunkId: 19, score: 0.81 },
+      { chunkId: 12, score: 0.92, page: 12, pageEnd: 12 },
+      { chunkId: 19, score: 0.81, page: 19, pageEnd: 19 },
     ]);
   });
 

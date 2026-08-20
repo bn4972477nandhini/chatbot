@@ -10,10 +10,58 @@ Rules:
   across them, the way a person who had read this book would.
 - If multiple chunks contain relevant information, synthesize and combine them
   into one coherent answer, even when no single chunk states the full answer
-  on its own.
+  on its own — but only when the chunks are complementary pieces of the same
+  answer. When chunks instead offer distinct, competing explanations for the
+  same question, follow the rule below on choosing between them rather than
+  blending them into one story.
 - Never state a specific fact, number, name, or claim that the context does
   not support. Reasoning about and summarizing what the context describes is
   expected; inventing details it does not describe is not.
+- When the context quotes or names more than one person, attribute each
+  statement or description to whoever actually said it or whom it actually
+  describes — never to the question's main subject by default just because
+  the text appears nearby.
+- When the context gives both a short form (a nickname, an abbreviation) and
+  a more complete form (a full name, an exact figure) for the same fact,
+  answer with the complete form.
+- A rhetorical or hypothetical question inside the context (e.g. "what would
+  you do in scenario X?") is not itself a case study, and a result or figure
+  stated near it may belong to a different, already-finished case study the
+  context described just before it. Only state a figure as the answer to the
+  user's question if the context actually ties that figure to that specific
+  subject — never because the two happen to sit next to each other.
+- When the user asks for a specific number and the context does not tie any
+  number to that exact subject, do not hedge with a qualitative stand-in
+  ("a small amount", "very little", "not much") either — that still implies
+  a figure the context never gave. Treat it the same as having no answer.
+  This applies to every kind of figure — money spent, reach, ROI, counts,
+  dates — not only monetary amounts. Before citing any such figure, confirm
+  the passage that states it is actually about the specific subject named in
+  the question; a passage about a different campaign, person, or event is
+  not evidence for the one asked about, even if it was retrieved alongside
+  the question or uses the same kind of metric.
+- When the context directly and explicitly states a concrete fact, name, or
+  reason that answers the question, give that directly. Do not pass over an
+  explicit, on-point statement in favor of a more general or thematic passage
+  elsewhere in the context that merely discusses related ideas.
+- A parenthetical inside a source that starts "(From: ...)" is context the
+  indexing process attached to confirm what that source's figures or facts
+  are actually about — it is not a separate, unconnected passage, and it is
+  exactly the kind of explicit confirmation the number-attribution rule above
+  asks for. When a source contains one, treat the subject it names as
+  confirmed for the figures in that same source, and cite the figure
+  directly rather than treating it as unconfirmed or belonging elsewhere.
+- If one passage names who or what specifically caused an event, and a
+  different passage only states a general goal or theme related to it, answer
+  with the specific cause, not the general goal — even if the general one is
+  phrased as if it directly answers the question. Do not combine the two into
+  one explanation unless the context itself ties them together; being
+  retrieved together is not the context tying them together.
+- If more than one passage offers a plausible but different, unconnected
+  answer to the same question, and nothing in the context indicates which one
+  the question is actually asking about, say plainly that the context offers
+  more than one possible answer and briefly state what each says, rather than
+  silently picking one or merging them into a single account.
 - Decide once, before you start writing: does the context contain information
   relevant to the question, or not?
   - If yes: write the synthesized answer and stop there. Do not follow it with
@@ -112,8 +160,12 @@ function formatContext(chunks) {
 
   for (let index = 0; index < chunks.length; index++) {
     const chunk = chunks[index];
+    const pageLabel =
+      chunk.page == null
+        ? ""
+        : ` | page: ${chunk.pageEnd != null && chunk.pageEnd !== chunk.page ? `${chunk.page}-${chunk.pageEnd}` : chunk.page}`;
     parts[index] =
-      `[Source ${index + 1} | chunkId: ${chunk.chunkId} | document: ${sanitiseText(chunk.source)}]\n` +
+      `[Source ${index + 1} | chunkId: ${chunk.chunkId}${pageLabel} | document: ${sanitiseText(chunk.source)}]\n` +
       sanitiseText(chunk.pageContent);
   }
 

@@ -166,7 +166,7 @@ function createApp({
 
   app.get("/read-pdf", async (req, res, next) => {
     try {
-      const text = await readPDF(BOOK_PATH);
+      const { text } = await readPDF(BOOK_PATH);
       const chunks = await chunkText(text);
 
       res.json({
@@ -180,9 +180,9 @@ function createApp({
 
   app.post("/index-book", indexLimiter, async (req, res, next) => {
     try {
-      const { totalChunks, indexedChunks } = await indexBook({ logger: req.log });
+      const { totalPages, totalChunks, indexedChunks } = await indexBook({ logger: req.log });
 
-      res.json({ success: true, totalChunks, indexedChunks });
+      res.json({ success: true, totalPages, totalChunks, indexedChunks });
     } catch (error) {
       next(error);
     }

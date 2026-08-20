@@ -3,7 +3,7 @@ import type { ChatResponse, Citation } from "../types/chat";
 const CHAT_ENDPOINT = "/chat";
 // Local Ollama inference is slower than a hosted API — mirrors the backend's
 // own OLLAMA_TIMEOUT_MS so the client doesn't give up before the server does.
-const REQUEST_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = 180_000;
 
 // Mirrors the server's MAX_QUESTION_LENGTH so an over-long question is caught
 // before it costs a round trip. The server still enforces its own limit.

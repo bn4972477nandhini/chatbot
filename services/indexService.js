@@ -3,7 +3,7 @@ const path = require("path");
 const { conflict, AppError } = require("../lib/errors");
 const { logger: defaultLogger } = require("../lib/logger");
 const { readPDF } = require("./pdfReader");
-const { chunkText } = require("./chunkService");
+const { chunkPages } = require("./chunkService");
 const {
   embedTexts: defaultEmbedTexts,
   EMBEDDING_DIMENSIONS,
@@ -39,7 +39,7 @@ function createIndexService({
     const startedAt = Date.now();
 
     const readStartedAt = Date.now();
-    const text = await readPDF(bookPath);
+    const { text, pages } = await readPDF(bookPath);
     const readMs = Date.now() - readStartedAt;
 
     if (!text.trim()) {
@@ -50,7 +50,7 @@ function createIndexService({
     }
 
     const chunkStartedAt = Date.now();
-    const chunks = await chunkText(text);
+    const chunks = await chunkPages(pages, { logger: log });
     const chunkMs = Date.now() - chunkStartedAt;
 
     const totalChunks = chunks.length;
@@ -59,8 +59,8 @@ function createIndexService({
     // rejects empty input.
     const documents = [];
     for (let index = 0; index < chunks.length; index++) {
-      const pageContent = chunks[index].pageContent;
-      if (pageContent.trim() !== "") documents.push({ index, pageContent });
+      const { pageContent, metadata } = chunks[index];
+      if (pageContent.trim() !== "") documents.push({ index, pageContent, metadata });
     }
 
     if (documents.length === 0) {
@@ -92,6 +92,11 @@ function createIndexService({
           chunkId: doc.index,
           pageContent: doc.pageContent,
           source: SOURCE_NAME,
+          page: doc.metadata.page,
+          pageEnd: doc.metadata.pageEnd,
+          section: doc.metadata.section,
+          sectionTitle: doc.metadata.sectionTitle,
+          hasStructuredData: doc.metadata.hasStructuredData ?? false,
         },
       }));
 
@@ -107,6 +112,7 @@ function createIndexService({
     }
 
     log.info("indexing complete", {
+      totalPages: pages.length,
       totalChunks,
       indexedChunks,
       readMs,
@@ -116,7 +122,7 @@ function createIndexService({
       totalMs: Date.now() - startedAt,
     });
 
-    return { totalChunks, indexedChunks };
+    return { totalPages: pages.length, totalChunks, indexedChunks };
   }
 
   /**

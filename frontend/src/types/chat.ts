@@ -1,6 +1,8 @@
 export interface Citation {
   chunkId: number;
   score: number;
+  page?: number | null;
+  pageEnd?: number | null;
 }
 
 export interface UserMessage {

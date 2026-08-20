@@ -12,7 +12,8 @@ const server = app.listen(config.port, () => {
   logger.info("server started", {
     port: config.port,
     env: config.nodeEnv,
-    chatModel: config.openai.chatModel,
+    llmProvider: config.llm.provider,
+    chatModel: config.llm.chatModel,
     collection: config.qdrant.collection,
     topK: config.retrieval.topK,
     mmr: config.retrieval.useMmr,

@@ -80,11 +80,11 @@ function createQdrantService({
       // Payload indexes make metadata filters efficient rather than full scans.
       // Failures here are non-fatal: filtering still works, just more slowly.
       await Promise.all(
-        ["source", "chunkId"].map((field) =>
+        ["source", "chunkId", "page"].map((field) =>
           qdrant
             .createPayloadIndex(collection, {
               field_name: field,
-              field_schema: field === "chunkId" ? "integer" : "keyword",
+              field_schema: field === "source" ? "keyword" : "integer",
               wait: true,
             })
             .catch(() => undefined)

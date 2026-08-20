@@ -10,6 +10,7 @@ const {
 
 const CHAT_MODEL = config.llm.chatModel;
 const TEMPERATURE = config.llm.temperature;
+const MAX_OUTPUT_TOKENS = config.llm.maxOutputTokens;
 
 /**
  * Builds the chat service. Dependencies are injected with real defaults so the
@@ -36,6 +37,7 @@ function createChatService({
       return await client.chat.completions.create({
         model,
         temperature: TEMPERATURE,
+        max_tokens: MAX_OUTPUT_TOKENS,
         messages,
       });
     } catch (error) {
@@ -49,7 +51,7 @@ function createChatService({
         temperature: TEMPERATURE,
       });
 
-      return client.chat.completions.create({ model, messages });
+      return client.chat.completions.create({ model, max_tokens: MAX_OUTPUT_TOKENS, messages });
     }
   }
 
@@ -71,6 +73,8 @@ function createChatService({
     const citations = chunks.map((chunk) => ({
       chunkId: chunk.chunkId,
       score: chunk.score,
+      page: chunk.page,
+      pageEnd: chunk.pageEnd,
     }));
 
     // Nothing cleared the score threshold — answer with the exact fallback the

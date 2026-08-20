@@ -27,7 +27,7 @@ describe("qdrantService.ensureCollection", () => {
 
     await service.ensureCollection(DIMENSIONS);
 
-    assert.deepEqual(client.state.indexes.sort(), ["chunkId", "source"]);
+    assert.deepEqual(client.state.indexes.sort(), ["chunkId", "page", "source"]);
   });
 
   it("does not recreate an existing collection", async () => {

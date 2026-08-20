@@ -90,6 +90,9 @@ function buildConfig() {
       useMmr: readString("RETRIEVAL_USE_MMR", "true") !== "false",
       mmrLambda: readFloat("RETRIEVAL_MMR_LAMBDA", 0.7, { min: 0, max: 1 }),
       mmrPoolMultiplier: readInt("RETRIEVAL_MMR_POOL_MULTIPLIER", 4, { min: 1, max: 20 }),
+      // Off by default: this issues one extra chat completion per question, so
+      // enabling it is a deliberate latency/recall trade-off, not a silent one.
+      useQueryExpansion: readString("RETRIEVAL_USE_QUERY_EXPANSION", "false") === "true",
     },
 
     limits: {
@@ -106,6 +109,13 @@ function buildConfig() {
     chunking: {
       chunkSize: readInt("CHUNK_SIZE", 1000, { min: 100, max: 8000 }),
       chunkOverlap: readInt("CHUNK_OVERLAP", 200, { min: 0, max: 4000 }),
+    },
+
+    chat: {
+      // Bounds worst-case generation time — without it a small local model has
+      // nothing stopping a rambling answer from running for as long as its
+      // context window allows. Applies to whichever provider is active.
+      maxOutputTokens: readInt("CHAT_MAX_OUTPUT_TOKENS", 500, { min: 50, max: 8000 }),
     },
   };
 
@@ -126,6 +136,7 @@ function buildConfig() {
         ? config.ollama.embeddingDimensions
         : config.openai.embeddingDimensions,
     temperature: config.openai.temperature,
+    maxOutputTokens: config.chat.maxOutputTokens,
     timeoutMs: llmProvider === "ollama" ? config.ollama.timeoutMs : config.openai.timeoutMs,
     // Ollama's OpenAI-compatible surface lives under /v1. Left undefined for the
     // real OpenAI provider so the SDK uses its own default.
