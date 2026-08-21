@@ -128,6 +128,73 @@ describe("retrievalService", () => {
     assert.ok(chunks.some((c) => c.chunkId === 1), "the lexically-guaranteed chunk is still included");
   });
 
+  it("promotes a directly-confirmed chunk ahead of a merely topically-similar one when their scores are close", async () => {
+    // General evidence-directness signal: an exact keyword hit is stronger
+    // proof of "this passage answers the question" than raw cosine similarity
+    // alone, which only measures topical closeness. A small ranking nudge
+    // reorders near-ties in its favour without ever overriding a genuinely
+    // large score gap (covered by the test above, gap 0.35 >> the nudge).
+    const directHit = point(1, 0.60, [0.9, 0.1]);
+    directHit.payload.pageContent = "distinctive literally states the fact directly";
+    const genericMention = point(2, 0.62, [0.1, 0.9]); // slightly higher score, but no keyword overlap
+    const filler = Array.from({ length: 5 }, (_, i) => point(10 + i, 0.55, [0, 1 + i * 1e-6]));
+
+    const { service } = build({
+      onSearch: (options) =>
+        options.scoreThreshold === 0
+          ? [genericMention, directHit, ...filler]
+          : [genericMention, ...filler],
+    });
+
+    const { chunks } = await service.retrieve("distinctive literally states", {
+      limit: 5,
+      useMmr: true,
+    });
+
+    assert.equal(
+      chunks[0].chunkId,
+      1,
+      "the directly-confirmed chunk outranks a near-tied but merely topical one"
+    );
+  });
+
+  it("does not let the directness nudge override a genuinely stronger, unconfirmed match", async () => {
+    // The flip side of the test above: a small score gap gets reordered, but
+    // a real one (far larger than the nudge) never does — directness is a
+    // tie-breaker, not a replacement for relevance.
+    const directHitWeak = point(1, 0.40, [0.9, 0.1]);
+    directHitWeak.payload.pageContent = "distinctive literally states the fact directly";
+    const strongMatch = point(2, 0.85, [0.1, 0.9]);
+    const filler = Array.from({ length: 5 }, (_, i) => point(10 + i, 0.55, [0, 1 + i * 1e-6]));
+
+    const { service } = build({
+      onSearch: (options) =>
+        options.scoreThreshold === 0
+          ? [strongMatch, directHitWeak, ...filler]
+          : [strongMatch, ...filler],
+    });
+
+    const { chunks } = await service.retrieve("distinctive literally states", {
+      limit: 5,
+      useMmr: true,
+    });
+
+    assert.equal(chunks[0].chunkId, 2, "a large score gap still wins over the directness nudge");
+  });
+
+  it("promotes a chunk flagged with structured data (a LABEL: value line) ahead of a near-tied generic chunk", async () => {
+    const structured = point(1, 0.58, [0.9, 0.1]);
+    structured.payload.hasStructuredData = true;
+    const generic = point(2, 0.60, [0.1, 0.9]);
+    const filler = Array.from({ length: 5 }, (_, i) => point(10 + i, 0.55, [0, 1 + i * 1e-6]));
+
+    const { service } = build({ points: [structured, generic, ...filler] });
+
+    const { chunks } = await service.retrieve("q", { limit: 5, useMmr: true });
+
+    assert.equal(chunks[0].chunkId, 1, "the structured-data chunk outranks a near-tied generic one");
+  });
+
   it("widens the candidate pool when MMR is on", async () => {
     const { service, calls } = build({ points: [] });
 

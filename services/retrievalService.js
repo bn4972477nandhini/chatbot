@@ -5,6 +5,7 @@ const { maximalMarginalRelevance } = require("./mmr");
 const { searchPoints: defaultSearchPoints } = require("./qdrantService");
 const { createQueryExpansionService } = require("./queryExpansionService");
 const { rankByBm25 } = require("./lexicalRetrievalService");
+const { isNumericQuestion } = require("./queryUnderstanding");
 
 const { expandQuery: defaultExpandQuery } = createQueryExpansionService();
 
@@ -414,7 +415,41 @@ function createRetrievalService({
           // Re-sorting by score keeps the inclusion guarantee while making
           // the strongest evidence "Source 1" regardless of which mechanism
           // (guarantee or MMR) is why it is present at all.
-          return [...guaranteed, ...remaining].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+          //
+          // A small additional nudge on top of raw score: cosine similarity
+          // alone can rank a chunk that only discusses a topic generally
+          // above one that states the specific fact directly (an exact
+          // keyword hit, or the indexer's own flag that this chunk carries a
+          // structured LABEL: value line) — general, corpus-independent
+          // signals of "this passage directly answers a factual question"
+          // rather than "this passage is merely on the same topic". The
+          // bonus is deliberately small (comparable to the score gap between
+          // adjacent real sources, well below the gap between a genuinely
+          // strong and a genuinely weak match), so it only reorders close
+          // calls — it can promote a directly-confirmed chunk from "Source 3"
+          // to "Source 1" among near-ties, but never overrides a clearly
+          // higher-scoring, unconfirmed chunk.
+          const DIRECTNESS_BONUS = 0.03;
+          // A question asking for a quantity is disproportionately well
+          // served by a chunk the indexer already flagged as carrying a
+          // structured LABEL: value line — that pattern-detection is general
+          // (queryUnderstanding.js has no notion of any specific figure or
+          // campaign), so this only strengthens an existing general signal
+          // for a general class of question, not a rule for any one number.
+          const STRUCTURED_NUMERIC_BONUS = 0.06;
+          const questionIsNumeric = isNumericQuestion(question);
+          const lexicalMatchKeys = new Set(lexicalMatches.map(keyOf));
+          const directnessBonus = (point) => {
+            if (point.payload?.hasStructuredData === true) {
+              return questionIsNumeric ? STRUCTURED_NUMERIC_BONUS : DIRECTNESS_BONUS;
+            }
+            return lexicalMatchKeys.has(keyOf(point)) ? DIRECTNESS_BONUS : 0;
+          };
+          const effectiveScore = (point) => (point.score ?? 0) + directnessBonus(point);
+
+          return [...guaranteed, ...remaining].sort(
+            (a, b) => effectiveScore(b) - effectiveScore(a)
+          );
         })()
       : candidatePoints.slice(0, limit);
     const mmrMs = Date.now() - mmrStartedAt;

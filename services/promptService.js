@@ -21,6 +21,14 @@ Rules:
   statement or description to whoever actually said it or whom it actually
   describes — never to the question's main subject by default just because
   the text appears nearby.
+- Two attribution patterns are easy to misread under a quick reading: a
+  passage written in the first person ("I am X, a Y") states Y about the
+  speaker X, not about whoever else the passage — or the question — is
+  about; and a name immediately followed by a short title or credential line
+  (a byline or signature) attaches those credentials to that named person
+  specifically. A role or title stated either way stays with the person it
+  was actually stated about, even when a different person is mentioned far
+  more often nearby, or is who the question asks about.
 - When the context gives both a short form (a nickname, an abbreviation) and
   a more complete form (a full name, an exact figure) for the same fact,
   answer with the complete form.

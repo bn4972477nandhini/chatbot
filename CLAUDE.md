@@ -9,7 +9,7 @@ Two processes — backend at the repo root, frontend in `frontend/`.
 ```bash
 npm start                 # API on :3000
 npm run dev               # API with --watch
-npm test                  # all 148 tests (~20s)
+npm test                  # all 222 tests (~30s)
 npm run test:unit         # pure logic
 npm run test:integration  # indexing pipeline over the real founder.pdf, mocked network
 npm run test:api          # full Express stack over HTTP
@@ -166,7 +166,12 @@ execute for real without network access. Keep new services in this shape.
   finds chapter/section boundaries purely from page-length layout (a near-empty "divider" page
   followed by a short "title" page) — no book-specific strings — so a PDF that doesn't use that
   layout just degrades to everything in section 0. Both return LangChain `Document` objects
-  (`.pageContent`), not plain strings.
+  (`.pageContent`), not plain strings. Before chunking, `augmentPagesWithStructuredData` appends any
+  label/value table rows a page contains (`labelValueExtractor.js` detects the wide-gap column layout
+  a flattened PDF table/infographic leaves behind and pairs each ALL-CAPS label with its value) as
+  plain "Label: Value" lines, and any chunk containing that appended text is flagged
+  `metadata.hasStructuredData` — consumed by `retrievalService.js`'s directness bonus for
+  quantity-asking questions.
 - **`embeddingService.js`** — exports `EMBEDDING_DIMENSIONS` so the collection is created from the
   model's real vector size. Batches 96 inputs, **re-sorts responses by `index`** so vectors can't
   drift out of alignment with their chunks, and retries only 429/5xx/network — config errors and
@@ -186,14 +191,42 @@ execute for real without network access. Keep new services in this shape.
   `chatService` or the routes. The widened, unfiltered pool (`FALLBACK_POOL_SIZE`) runs whenever the
   dense pass found *anything*, **or** the question has distinctive keywords at all (`extractKeywords`)
   — the keyword-only trigger exists so a term dense search misses entirely (wrong topic vector, but
-  right words) can still be recovered by exact match. Two ranked lists get RRF-fused: an exact-keyword
-  lexical match over the wide pool always; the wide pool's raw similarity order only if the dense pass
-  was non-empty (that signal is a "best guess," so a genuinely off-topic question — no dense hits and
-  no keyword hits — still declines rather than resurrecting its nearest, irrelevant chunks). Separately,
-  the top ~2 lexical matches are carried through **untouched by MMR** (`guaranteedCount`) before MMR
+  right words) can still be recovered by exact match. Up to four ranked lists get RRF-fused: the dense
+  pool always; the wide pool ranked by BM25 (`lexicalRetrievalService.js`) against the extracted
+  keywords whenever there are any; the wide pool's raw similarity order only if the dense pass was
+  non-empty (a "best guess" signal, so a genuinely off-topic question — no dense hits and no keyword
+  hits — still declines rather than resurrecting its nearest, irrelevant chunks); and, if
+  `useQueryExpansion` is on (`RETRIEVAL_USE_QUERY_EXPANSION`, off by default) and the dense pass's top
+  hit isn't already lexically confirmed, up to two LLM-generated paraphrases of the question
+  (`queryExpansionService.js`) searched the same way — skipped whenever lexical and dense already agree
+  on the same top chunk, since there's nothing left for a paraphrase to rescue and the extra chat +
+  embedding round trip is the most expensive part of the pipeline on local Ollama. Independently of
+  fusion, a capped number of lexical/paraphrase-corroborated chunks and one same-section runner-up are
+  carried through **untouched by MMR** (`guaranteedCorroborated` / `guaranteedSection`) before MMR
   re-ranks the rest to fill the remaining `topK` slots — plain RRF fusion alone still let MMR's
-  diversity trade-off rank a lexically-confirmed chunk (e.g. "who wrote the foreword?") below one that
-  only *looked* more diverse.
+  diversity trade-off rank a corroborated chunk (e.g. "who wrote the foreword?") below one that only
+  *looked* more diverse, or let one dominant chunk claim the whole corroboration budget and starve a
+  different chunk that also needed rescuing. The final list is re-sorted by score plus a small
+  "directness" bonus — larger for a question `queryUnderstanding.isNumericQuestion` flags as asking for
+  a quantity — for a chunk that's an exact lexical match or that the indexer flagged
+  `hasStructuredData` (see `chunkService.js`/`labelValueExtractor.js`); the bonus is small enough to
+  only reorder near-ties, never to override a clearly higher-scoring, unconfirmed chunk.
+- **`lexicalRetrievalService.js`** — ranks a candidate pool by Okapi BM25 (via the retriever already
+  bundled in `@langchain/community`) rather than a raw term-frequency count, so a keyword common
+  across most of the pool doesn't crowd out a genuinely rare, on-topic hit. Lowercases its own scoring
+  copy of chunk text before matching — the underlying `okapibm25` package matches case-sensitively, but
+  source PDF text routinely capitalizes the exact words a question asks about (labels, headers, proper
+  nouns), so without this a keyword can silently score zero against a chunk that contains it verbatim
+  in a different case.
+- **`queryExpansionService.js`** — generates up to two alternative phrasings of the question via the
+  configured chat model to rescue a chunk dense search under-ranks for the exact wording asked (e.g.
+  "who wrote this book?" vs. "who is the author?"). Purely a recall aid: any failure (timeout, bad
+  response) is caught and logged, returning `[]` rather than failing the request. Off by default
+  because it costs one extra chat completion per question.
+- **`queryUnderstanding.js`** — purely structural question classification (leading wh-word, presence
+  of a digit/currency symbol, person-question phrasing, multi-part, short) with no book-specific
+  keyword lists, so it applies identically to a question about any book. Currently only
+  `isNumericQuestion` is consumed, by `retrievalService.js`'s structured-data bonus.
 - **`promptService.js`** — owns `SYSTEM_PROMPT` and `NO_ANSWER_REPLY` (the exact fallback string,
   which must stay identical to the wording inside the system prompt). Context is wrapped in
   `<<<CONTEXT_START>>>` / `<<<CONTEXT_END>>>` markers, and `sanitiseText` strips control characters,
