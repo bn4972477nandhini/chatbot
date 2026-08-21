@@ -1,6 +1,6 @@
 const { config } = require("../config/env");
 const { logger: defaultLogger } = require("../lib/logger");
-const { embedText: defaultEmbedText } = require("./embeddingService");
+const { embedText: defaultEmbedText, embedTexts: defaultEmbedTexts } = require("./embeddingService");
 const { maximalMarginalRelevance } = require("./mmr");
 const { searchPoints: defaultSearchPoints } = require("./qdrantService");
 const { createQueryExpansionService } = require("./queryExpansionService");
@@ -91,6 +91,7 @@ function reciprocalRankFusion(rankedLists, { k = 60, key = (item) => item.id } =
  */
 function createRetrievalService({
   embedText = defaultEmbedText,
+  embedTexts = defaultEmbedTexts,
   searchPoints = defaultSearchPoints,
   expandQuery = defaultExpandQuery,
   logger = defaultLogger,
@@ -134,6 +135,8 @@ function createRetrievalService({
       );
     }
 
+    const keyOf = (point) => point.payload?.chunkId ?? point.id;
+
     const embedStartedAt = Date.now();
     const vector = await embedText(question);
     const embedMs = Date.now() - embedStartedAt;
@@ -145,6 +148,7 @@ function createRetrievalService({
       : limit;
 
     const searchStartedAt = Date.now();
+    const denseSearchStartedAt = searchStartedAt;
     const densePoints = await searchPoints(vector, {
       limit: poolSize,
       scoreThreshold,
@@ -152,6 +156,7 @@ function createRetrievalService({
       withVector: useMmr,
       filter,
     });
+    const denseSearchMs = Date.now() - denseSearchStartedAt;
 
     // Dense embeddings can under-rank a short, fact-dense chunk (a copyright
     // page's "Author: X" line) against a natural-language question, even
@@ -173,6 +178,7 @@ function createRetrievalService({
     // poorly, or oddly tokenised text from PDF extraction).
     const shouldWiden = densePoints.length > 0 || keywords.length > 0;
 
+    const widenStartedAt = Date.now();
     if (shouldWiden) {
       const widePool = await searchPoints(vector, {
         limit: FALLBACK_POOL_SIZE,
@@ -212,6 +218,24 @@ function createRetrievalService({
         rankedLists.push(widePool.slice(0, FALLBACK_MATCH_COUNT));
       }
     }
+    const widenMs = Date.now() - widenStartedAt;
+
+    // A paraphrase call only ever exists to rescue a chunk the dense pass
+    // under-ranked for the exact wording asked. When the dense pass's own top
+    // hit is *already* independently confirmed by an exact keyword match,
+    // there is nothing left for a paraphrase to rescue — dense and lexical
+    // signals already agree on the same chunk, so the question is a confident,
+    // direct match rather than an ambiguous one. Skipping the LLM call (plus
+    // its own embedding + search round trips) in that case is a pure latency
+    // win with no accuracy cost: this is a structural agreement between two
+    // independent signals, not a guess about question wording or topic, so it
+    // generalises to any question rather than any specific phrasing. When the
+    // signals do NOT already agree — no keyword overlap at all, or the
+    // keyword match lands on a different chunk than the dense pass's top pick
+    // — expansion still runs exactly as before.
+    const topDenseKey = densePoints.length > 0 ? keyOf(densePoints[0]) : null;
+    const isTopDenseChunkLexicallyConfirmed =
+      topDenseKey != null && lexicalMatches.some((point) => keyOf(point) === topDenseKey);
 
     // Paraphrase signal: a chunk dense search ranks reasonably for the
     // question as asked, but not prominently, can rank clearly higher for a
@@ -228,51 +252,63 @@ function createRetrievalService({
     // question's paraphrases can't resurrect irrelevant chunks just by
     // asking again — this is a "best guess" signal, not independent proof of
     // relevance, exactly like the wide pool's raw-similarity signal above.
-    if (useQueryExpansion && densePoints.length > 0) {
+    const expansionStartedAt = Date.now();
+    if (useQueryExpansion && densePoints.length > 0 && !isTopDenseChunkLexicallyConfirmed) {
       const variants = await expandQuery(question).catch(() => []);
       expandedQueryCount = variants.length;
-      const seenExpansionKeys = new Set();
 
-      for (const variant of variants) {
-        const variantVector = await embedText(variant);
-        const variantPoints = await searchPoints(variantVector, {
-          limit: FALLBACK_MATCH_COUNT,
-          scoreThreshold: 0,
-          withPayload: true,
-          withVector: useMmr,
-          filter,
-        });
-        if (variantPoints.length > 0) rankedLists.push(variantPoints);
+      if (variants.length > 0) {
+        // Batched into one embeddings call rather than one per variant: on
+        // the local, CPU-only Ollama setup every call — embedding or chat —
+        // is serialized through a single queue (openaiClient.js), so N
+        // separate calls cost N full round trips with no concurrency benefit
+        // whatsoever. One call embedding N variants together removes that
+        // per-call overhead entirely. The Qdrant searches that follow are NOT
+        // subject to that queue, so they run concurrently for a further,
+        // smaller win.
+        const variantVectors = await embedTexts(variants);
+        const variantSearches = await Promise.all(
+          variantVectors.map((variantVector) =>
+            searchPoints(variantVector, {
+              limit: FALLBACK_MATCH_COUNT,
+              scoreThreshold: 0,
+              withPayload: true,
+              withVector: useMmr,
+              filter,
+            })
+          )
+        );
 
-        // The best results a variant's own search ranked highest are as
-        // strong a relevance signal as an exact keyword hit — a paraphrase
-        // rather than a literal match, but independent corroboration either
-        // way — so they earn the same MMR-diversity-penalty protection below.
-        // Measured against the real book: the correct chunk placed 2nd or
-        // 3rd (never 1st — a different chunk consistently mentions the same
-        // person more often) depending on the exact generated wording, so a
-        // top-2 cutoff was too narrow to reliably catch it; the actual
-        // guarantee budget below is still capped independently of this.
-        for (const p of variantPoints.slice(0, 3)) {
-          const key = p.payload?.chunkId ?? p.id;
-          if (seenExpansionKeys.has(key)) continue;
-          seenExpansionKeys.add(key);
-          expansionMatches.push(p);
+        const seenExpansionKeys = new Set();
+        for (const variantPoints of variantSearches) {
+          if (variantPoints.length > 0) rankedLists.push(variantPoints);
+
+          // The best results a variant's own search ranked highest are as
+          // strong a relevance signal as an exact keyword hit — a paraphrase
+          // rather than a literal match, but independent corroboration either
+          // way — so they earn the same MMR-diversity-penalty protection below.
+          // Measured against the real book: the correct chunk placed 2nd or
+          // 3rd (never 1st — a different chunk consistently mentions the same
+          // person more often) depending on the exact generated wording, so a
+          // top-2 cutoff was too narrow to reliably catch it; the actual
+          // guarantee budget below is still capped independently of this.
+          for (const p of variantPoints.slice(0, 3)) {
+            const key = keyOf(p);
+            if (seenExpansionKeys.has(key)) continue;
+            seenExpansionKeys.add(key);
+            expansionMatches.push(p);
+          }
         }
       }
     }
+    const expansionMs = Date.now() - expansionStartedAt;
 
     if (rankedLists.length > 0) {
       candidatePoints =
         rankedLists.length > 1
-          ? reciprocalRankFusion(rankedLists, {
-              key: (point) => point.payload?.chunkId ?? point.id,
-            })
+          ? reciprocalRankFusion(rankedLists, { key: keyOf })
           : rankedLists[0];
     }
-    const searchMs = Date.now() - searchStartedAt;
-
-    const keyOf = (point) => point.payload?.chunkId ?? point.id;
 
     // An exact keyword match is strong, independent evidence of relevance —
     // unlike a raw cosine score, MMR's diversity trade-off has no way to know
@@ -284,6 +320,7 @@ function createRetrievalService({
     // selection; MMR still governs the remaining slots as before. Capped well
     // below `limit` so MMR always keeps at least a couple of slots to work
     // with — this is a floor under strong evidence, not a replacement for it.
+    const mmrStartedAt = Date.now();
     const selected = useMmr
       ? (() => {
           const candidateKeys = new Set(candidatePoints.map(keyOf));
@@ -380,6 +417,8 @@ function createRetrievalService({
           return [...guaranteed, ...remaining].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
         })()
       : candidatePoints.slice(0, limit);
+    const mmrMs = Date.now() - mmrStartedAt;
+    const searchMs = Date.now() - searchStartedAt;
 
     const chunks = selected.map((point) => ({
       score: point.score,
@@ -394,18 +433,32 @@ function createRetrievalService({
       sectionTitle: point.payload?.sectionTitle ?? null,
     }));
 
+    // Per-stage breakdown so it's visible where request time actually goes on
+    // the CPU-only local Ollama setup: embedMs and expansionMs are the only
+    // stages that call the (serialized, single-queue) LLM client, so they
+    // dominate total latency whenever they run; denseSearchMs/widenMs/mmrMs
+    // are local Qdrant + in-process CPU work and are normally near-instant.
+    const timings = {
+      embedMs,
+      denseSearchMs,
+      widenMs,
+      expansionMs,
+      mmrMs,
+      searchMs,
+    };
+
     logger.debug("retrieval complete", {
       poolSize: densePoints.length,
       lexicalMatchCount,
       expandedQueryCount,
+      expansionSkipped: useQueryExpansion && densePoints.length > 0 && isTopDenseChunkLexicallyConfirmed,
       returned: chunks.length,
       scoreThreshold,
       useMmr,
-      embedMs,
-      searchMs,
+      ...timings,
     });
 
-    return { chunks, timings: { embedMs, searchMs } };
+    return { chunks, timings };
   }
 
   return { retrieve };

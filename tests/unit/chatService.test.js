@@ -136,4 +136,99 @@ describe("chatService", () => {
     assert.equal(completed.fields.embedMs, 1);
     assert.equal(completed.fields.searchMs, 2);
   });
+
+  describe("response cache", () => {
+    // General-purpose, keyed only on the literal question (+ options) — never
+    // on any specific question's text or content, so this exercises the cache
+    // mechanism itself, not a particular evaluation question.
+    it("serves a repeated, identical question from cache without re-retrieving or re-calling the model", async () => {
+      let retrieveCalls = 0;
+      const openai = createMockOpenAI({ answer: "A mock answer." });
+      const service = createChatService({
+        retrievalService: {
+          retrieve: async () => {
+            retrieveCalls++;
+            return { chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } };
+          },
+        },
+        getClient: () => openai,
+        logger: createTestLogger(),
+      });
+
+      const first = await service.ask("What is X?");
+      const second = await service.ask("What is X?");
+
+      assert.deepEqual(second, first);
+      assert.equal(retrieveCalls, 1, "retrieval only runs once");
+      assert.equal(openai.calls.chat.length, 1, "the model is only called once");
+    });
+
+    it("does not serve a cached answer for a different question", async () => {
+      const openai = createMockOpenAI({ answer: "A mock answer." });
+      const service = createChatService({
+        retrievalService: {
+          retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+        },
+        getClient: () => openai,
+        logger: createTestLogger(),
+      });
+
+      await service.ask("What is X?");
+      await service.ask("What is Y?");
+
+      assert.equal(openai.calls.chat.length, 2, "a genuinely different question is not a cache hit");
+    });
+
+    it("does not serve a cached answer when retrieval options differ", async () => {
+      const openai = createMockOpenAI({ answer: "A mock answer." });
+      const service = createChatService({
+        retrievalService: {
+          retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+        },
+        getClient: () => openai,
+        logger: createTestLogger(),
+      });
+
+      await service.ask("q", { limit: 5 });
+      await service.ask("q", { limit: 3 });
+
+      assert.equal(openai.calls.chat.length, 2, "different options must not collide in the cache key");
+    });
+
+    it("does not cache an empty completion", async () => {
+      const openai = createMockOpenAI({ answer: "" });
+      const service = createChatService({
+        retrievalService: {
+          retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+        },
+        getClient: () => openai,
+        logger: createTestLogger(),
+      });
+
+      await service.ask("q");
+      await service.ask("q");
+
+      assert.equal(openai.calls.chat.length, 2, "an empty completion is retried, not served from cache");
+    });
+
+    it("clearResponseCache empties the cache", async () => {
+      let retrieveCalls = 0;
+      const service = createChatService({
+        retrievalService: {
+          retrieve: async () => {
+            retrieveCalls++;
+            return { chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } };
+          },
+        },
+        getClient: () => createMockOpenAI({ answer: "A mock answer." }),
+        logger: createTestLogger(),
+      });
+
+      await service.ask("q");
+      service.clearResponseCache();
+      await service.ask("q");
+
+      assert.equal(retrieveCalls, 2, "a cleared cache is a fresh miss");
+    });
+  });
 });

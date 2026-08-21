@@ -58,4 +58,25 @@ describe("rankByBm25", () => {
 
     assert.equal(ranked[0], original);
   });
+
+  it("matches a keyword against differently-cased source text (a capitalized label, a sentence-initial word)", async () => {
+    // extractKeywords() always lowercases the question, but PDF-extracted text
+    // routinely capitalizes the very word a question asks about — a label
+    // ("Author: Jane Doe"), a heading, or just the start of a sentence. The
+    // underlying "okapibm25" package matches with a case-sensitive regex, so
+    // without normalising case here, a keyword can score zero against every
+    // chunk in the pool even though it appears verbatim, just capitalized.
+    const labelled = point(1, "Business Development - Jane Doe\nAuthor: Jane Doe");
+    const sentenceInitial = point(2, "Author of three prior books, she began writing young.");
+    const unrelated = point(3, "this chunk never mentions that role at all");
+    const points = [labelled, sentenceInitial, unrelated];
+
+    const ranked = await rankByBm25(points, ["author"]);
+
+    assert.deepEqual(
+      ranked.map((p) => p.id),
+      [1, 2],
+      "both capitalized occurrences are found, ranked above the chunk with no match at all"
+    );
+  });
 });
