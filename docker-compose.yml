@@ -28,11 +28,35 @@ services:
       # Service name resolves on the compose network — not localhost.
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-founder_book}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set}
+      # ollama (default here) or openai — see .env.example. OPENAI_API_KEY is
+      # only required when LLM_PROVIDER=openai; left optional at the compose
+      # level because the app's own /health and startup checks already give a
+      # clear error if it's missing and actually needed.
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CHAT_MODEL: ${CHAT_MODEL:-gpt-5.5}
+      # Ollama itself is not a compose service — it's assumed to run on the
+      # host (GPU/CPU service, not containerized here). host.docker.internal
+      # resolves to the host from inside the container on Docker Desktop
+      # (Windows/Mac); the extra_hosts entry below makes the same name work
+      # on native Linux Docker too.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_LLM_MODEL: ${OLLAMA_LLM_MODEL:-llama3.2}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      OLLAMA_EMBEDDING_DIMENSIONS: ${OLLAMA_EMBEDDING_DIMENSIONS:-768}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-180000}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+      CHAT_TEMPERATURE: ${CHAT_TEMPERATURE:-0.1}
+      CHAT_MAX_OUTPUT_TOKENS: ${CHAT_MAX_OUTPUT_TOKENS:-150}
+      CHAT_SEED: ${CHAT_SEED:-}
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
-      RETRIEVAL_SCORE_THRESHOLD: ${RETRIEVAL_SCORE_THRESHOLD:-0.65}
+      RETRIEVAL_SCORE_THRESHOLD: ${RETRIEVAL_SCORE_THRESHOLD:-0.52}
       RETRIEVAL_USE_MMR: ${RETRIEVAL_USE_MMR:-true}
+      RETRIEVAL_USE_QUERY_EXPANSION: ${RETRIEVAL_USE_QUERY_EXPANSION:-true}
+    extra_hosts:
+      # No-op on Docker Desktop (host.docker.internal already resolves there);
+      # required for the same name to resolve on native Linux Docker.
+      - "host.docker.internal:host-gateway"
     depends_on:
       qdrant:
         condition: service_healthy

@@ -56,6 +56,22 @@ function isShortQuestion(question) {
   return question.trim().split(/\s+/).filter(Boolean).length <= SHORT_QUESTION_WORD_COUNT;
 }
 
+// Generic English terms for "summarize this whole thing" — none tied to any
+// particular book's content, so this applies identically regardless of what
+// book is indexed. Deliberately narrow (whole-work synthesis, not "what does
+// X mean") so it doesn't overlap with isPersonQuestion or isNumericQuestion.
+const ABSTRACT_PATTERN =
+  /\b(summar(y|ize|ise)|main (message|idea|point|theme)|key (ideas?|takeaways?)|overview|gist)\b/i;
+
+/**
+ * Whether the question asks for a whole-book synthesis (a summary or "main
+ * message") rather than a specific fact — legitimately answered by several
+ * chunks at once, unlike most questions.
+ */
+function isAbstractQuestion(question) {
+  return ABSTRACT_PATTERN.test(question);
+}
+
 /** Convenience bundle of every classification, computed once per question. */
 function classifyQuestion(question) {
   return {
@@ -64,6 +80,7 @@ function classifyQuestion(question) {
     isPerson: isPersonQuestion(question),
     isMultiPart: isMultiPart(question),
     isShort: isShortQuestion(question),
+    isAbstract: isAbstractQuestion(question),
   };
 }
 
@@ -73,5 +90,6 @@ module.exports = {
   isPersonQuestion,
   isMultiPart,
   isShortQuestion,
+  isAbstractQuestion,
   classifyQuestion,
 };

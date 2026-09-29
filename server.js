@@ -3,6 +3,7 @@ require("dotenv").config();
 const { config, missingCredentials } = require("./config/env");
 const { logger, serialiseError } = require("./lib/logger");
 const { createApp } = require("./app");
+const { getOpenAIClient } = require("./services/openaiClient");
 
 const app = createApp();
 
@@ -23,6 +24,27 @@ const server = app.listen(config.port, () => {
     logger.warn("missing credentials — /chat and /index-book will fail until set", {
       missing,
     });
+  }
+
+  // Fires a trivial completion so the model is already resident in Ollama
+  // before the first real request — a cold load measured at ~12.5s would
+  // otherwise land on whichever user asks first. Purely a latency nicety:
+  // failure (Ollama not up yet, wrong provider) is logged and swallowed,
+  // never blocks startup or affects request handling.
+  if (config.llm.provider === "ollama") {
+    const warmupStartedAt = Date.now();
+    getOpenAIClient()
+      .chat.completions.create({
+        model: config.llm.chatModel,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 1,
+      })
+      .then(() => {
+        logger.info("model warm-up complete", { durationMs: Date.now() - warmupStartedAt });
+      })
+      .catch((error) => {
+        logger.warn("model warm-up failed — first real request will pay the load cost", serialiseError(error));
+      });
   }
 });
 

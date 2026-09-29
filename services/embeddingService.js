@@ -21,6 +21,17 @@ const QUERY_CACHE_LIMIT = 256;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * True for our own explicit per-request abort (see requestTimeoutSignal
+ * below), under whatever name/shape the SDK wraps it in. Retrying a request
+ * that timed out on its own hard deadline is unlikely to succeed any faster
+ * a second time, and would otherwise multiply the worst-case wait by
+ * MAX_RETRIES — the opposite of what a hard timeout exists to guarantee.
+ */
+function isAbortError(error) {
+  return error?.name === "AbortError" || /aborted/i.test(error?.message ?? "");
+}
+
+/**
  * Rate limits (429) and transient 5xx responses are the common failure mode when
  * embedding a whole book, so those are retried with exponential backoff. Client
  * errors such as 401 or 400 fail immediately — retrying them cannot help.
@@ -28,6 +39,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function isRetryable(error) {
   // Our own configuration errors are never worth retrying.
   if (error instanceof AppError) return false;
+  if (isAbortError(error)) return false;
 
   const status = error?.status;
   if (status === undefined) {
@@ -43,8 +55,26 @@ function isRetryable(error) {
  *
  * @param {object} [deps]
  * @param {Function} [deps.getClient] returns an OpenAI-compatible client
+ * @param {number}   [deps.timeoutMs] hard per-attempt deadline (see
+ *   requestTimeoutSignal) — overridable so tests don't have to wait out the
+ *   real configured value
  */
-function createEmbeddingService({ getClient = getOpenAIClient } = {}) {
+function createEmbeddingService({ getClient = getOpenAIClient, timeoutMs = config.llm.timeoutMs } = {}) {
+  /**
+   * A hung embeddings call must never be able to block the caller (and, since
+   * every Ollama call is serialized through one queue, every later request
+   * behind it) indefinitely — this is exactly the path a real incident found
+   * unprotected: query-expansion's variant-embedding call hung for several
+   * minutes because only the client's own constructor-level timeout covered
+   * it, and that alone did not reliably enforce the configured deadline. An
+   * explicit, request-scoped AbortSignal is a second, independent
+   * enforcement path that does not depend on how the client's internal
+   * timeout happens to be implemented. A fresh signal is created per HTTP
+   * attempt — an already-fired AbortSignal.timeout() cannot be reused.
+   */
+  function requestTimeoutSignal() {
+    return AbortSignal.timeout(timeoutMs);
+  }
   /** Insertion-ordered Map used as a small LRU for query embeddings. */
   const queryCache = new Map();
 
@@ -77,10 +107,13 @@ function createEmbeddingService({ getClient = getOpenAIClient } = {}) {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const response = await openai.embeddings.create({
-          model: EMBEDDING_MODEL,
-          input: inputs,
-        });
+        const response = await openai.embeddings.create(
+          {
+            model: EMBEDDING_MODEL,
+            input: inputs,
+          },
+          { signal: requestTimeoutSignal() }
+        );
 
         // The API documents results as index-tagged; sort defensively so vectors
         // can never drift out of alignment with their source chunks.

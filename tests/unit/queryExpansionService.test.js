@@ -50,6 +50,39 @@ describe("expandQuery", () => {
     assert.deepEqual(variants, ["Who is the author?"]);
   });
 
+  it("aborts a hung completion call within the configured timeout, rather than hanging", async () => {
+    // Never resolves or rejects on its own — only settles when the signal
+    // expandQuery passed in fires, proving the timeout is what ends the call.
+    // Expansion already degrades to [] on any failure (including this one),
+    // so the real assertion here is speed: it must not be able to hang for
+    // anywhere near as long as the real 27-minute incident this guards against.
+    const openai = {
+      chat: {
+        completions: {
+          create: (params, { signal }) =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
+            }),
+        },
+      },
+    };
+    const { expandQuery } = createQueryExpansionService({
+      getClient: () => openai,
+      logger: createTestLogger(),
+      timeoutMs: 50,
+    });
+
+    const startedAt = Date.now();
+    const variants = await expandQuery("Who wrote this book?");
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.deepEqual(variants, []);
+    assert.ok(
+      elapsedMs < 2000,
+      `expected the hung call to abort near the configured 50ms timeout, took ${elapsedMs}ms`
+    );
+  });
+
   it("returns an empty list, never throws, when the completion call fails", async () => {
     const openai = {
       chat: { completions: { create: async () => { throw new Error("network down"); } } },

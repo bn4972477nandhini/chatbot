@@ -9,7 +9,8 @@ Two processes — backend at the repo root, frontend in `frontend/`.
 ```bash
 npm start                 # API on :3000
 npm run dev               # API with --watch
-npm test                  # all 222 tests (~30s)
+npm test                  # whole suite (~35s)
+npm run test:watch        # whole suite, re-run on change
 npm run test:unit         # pure logic
 npm run test:integration  # indexing pipeline over the real founder.pdf, mocked network
 npm run test:api          # full Express stack over HTTP
@@ -62,8 +63,16 @@ guessing a new `RETRIEVAL_SCORE_THRESHOLD`.
 
 ## Architecture
 
-Single-turn RAG over one book (`uploads/founder.pdf`). No conversation memory, no streaming, no
-auth: `/chat` sends one question and nothing carries between requests.
+Single-turn RAG over one book (`uploads/founder.pdf`). No conversation memory and no auth: `/chat`
+sends one question and nothing carries between requests (apart from a short-lived response cache —
+see `chatService.js`).
+
+`/chat` has two response modes. The default is one JSON body `{ answer, citations }`. With
+`"stream": true` it answers as Server-Sent Events: `citations` (sent as soon as retrieval finishes),
+then one `token` event per model fragment, then `done` — or `error` in place of `done`, because
+once SSE headers are committed the JSON error boundary can no longer run, so the route applies the
+same `AppError.expose` rule itself. A client disconnect (`res.on("close")`, not `req`) aborts the
+in-flight model call. The frontend always uses the streaming mode (`chatApi.streamQuestion`).
 
 `server.js` is bootstrap only — listen, log startup, graceful shutdown. `app.js` owns the Express
 app: middleware, routes, and a single error boundary. Routes validate, call a service, shape a
@@ -87,11 +96,17 @@ uploads/founder.pdf
 
 ```
 question
+  → conversationalIntentService   exact-match small talk ("hi", "thanks", "bye") → canned reply, stop
+  → response cache                LRU (100) + 10-min TTL keyed on question + options → stop on hit
   → retrievalService  embed → Qdrant query (pool = topK×4 when MMR) → MMR re-rank to topK
+                      (topK+2 for whole-book "summarize / main idea" questions — isAbstractQuestion)
   → promptService     system prompt + sanitised context block + question
-  → chatService       chat completion, temperature 0.2
-  → { answer, citations: [{ chunkId, score }] }
+  → chatService       chat completion (CHAT_TEMPERATURE, default 0.2), buffered or streamed
+  → { answer, citations: [{ chunkId, score, page, pageEnd }] }
 ```
+
+`ask()` and `askStream()` share one `prepareRequest()` (small talk → cache → retrieval → prompt), so
+the two paths can't drift apart. Only how the model gets called differs between them.
 
 ### Configuration
 
@@ -134,8 +149,21 @@ chat both go through `getOpenAIClient()`. Never `new OpenAI()` elsewhere. It set
 because `embeddingService` implements its own backoff; letting the SDK also retry would multiply
 attempts.
 
+With Ollama, the client is wrapped (`serializeOllamaClient`) so that **every** chat and embedding
+call runs through a single FIFO queue, one at a time. Concurrent calls measurably slowed each other
+down on local inference, to the point of hitting `OLLAMA_TIMEOUT_MS`. So firing several LLM calls in
+parallel gains nothing under Ollama — batch into one call instead (retrieval does this for query
+embeddings). It also means an abandoned generation blocks every later request, which is why the
+streaming route aborts on disconnect. Ollama requests also send `keep_alive` (`OLLAMA_KEEP_ALIVE`,
+default `30m`); an optional `CHAT_SEED` pins sampling for reproducible evals.
+
 Both it and the Qdrant client are built **lazily** on first use. Both expose `setOpenAIClient` /
 `setQdrantClient` as test seams.
+
+`server.js` fires a one-token warm-up completion against `config.llm.chatModel` right after
+`app.listen`, but only when `config.llm.provider === "ollama"` — a cold Ollama model load measured
+at ~12.5s would otherwise land on whichever user asks the first real question. Fire-and-forget:
+failure is logged and swallowed, never blocks startup or delays `/health`.
 
 ### Dependency injection
 
@@ -206,11 +234,19 @@ execute for real without network access. Keep new services in this shape.
   re-ranks the rest to fill the remaining `topK` slots — plain RRF fusion alone still let MMR's
   diversity trade-off rank a corroborated chunk (e.g. "who wrote the foreword?") below one that only
   *looked* more diverse, or let one dominant chunk claim the whole corroboration budget and starve a
-  different chunk that also needed rescuing. The final list is re-sorted by score plus a small
-  "directness" bonus — larger for a question `queryUnderstanding.isNumericQuestion` flags as asking for
-  a quantity — for a chunk that's an exact lexical match or that the indexer flagged
-  `hasStructuredData` (see `chunkService.js`/`labelValueExtractor.js`); the bonus is small enough to
-  only reorder near-ties, never to override a clearly higher-scoring, unconfirmed chunk.
+  different chunk that also needed rescuing. A chunk matched by `hasInlineLabelValue` — an explicit
+  "Label: Value" line in ordinary prose (e.g. a copyright page's "Author: Jane Doe") that isn't the
+  wide-gap table shape `labelValueExtractor.js` looks for, so the indexer never flags it — gets one
+  guaranteed slot the same way, capped separately from the lexical/section guarantees so it can't
+  displace them. Lexical top-chunk agreement (gating query expansion) requires *every* extracted
+  keyword to appear in the top dense chunk's own text once there are enough keywords to make that
+  meaningful (≥4, majority match), not just that chunk's membership in a pooled BM25 ranking — BM25
+  can rank a chunk highly off a single shared keyword even when it's about something else entirely.
+  The final list is re-sorted by score plus a small "directness" bonus — larger for a question
+  `queryUnderstanding.isNumericQuestion` flags as asking for a quantity — for a chunk that's an exact
+  lexical match, an inline label/value match, or that the indexer flagged `hasStructuredData` (see
+  `chunkService.js`/`labelValueExtractor.js`); the bonus is small enough to only reorder near-ties,
+  never to override a clearly higher-scoring, unconfirmed chunk.
 - **`lexicalRetrievalService.js`** — ranks a candidate pool by Okapi BM25 (via the retriever already
   bundled in `@langchain/community`) rather than a raw term-frequency count, so a keyword common
   across most of the pool doesn't crowd out a genuinely rare, on-topic hit. Lowercases its own scoring
@@ -225,8 +261,14 @@ execute for real without network access. Keep new services in this shape.
   because it costs one extra chat completion per question.
 - **`queryUnderstanding.js`** — purely structural question classification (leading wh-word, presence
   of a digit/currency symbol, person-question phrasing, multi-part, short) with no book-specific
-  keyword lists, so it applies identically to a question about any book. Currently only
-  `isNumericQuestion` is consumed, by `retrievalService.js`'s structured-data bonus.
+  keyword lists, so it applies identically to a question about any book. Two classifiers are consumed:
+  `isNumericQuestion` by `retrievalService.js`'s structured-data bonus, and `isAbstractQuestion` by
+  `chatService.js` to widen the evidence limit (only when the caller passed no explicit `limit`; an
+  experiment that also widened for multi-part questions made answers worse, so that is deliberately
+  excluded).
+- **`conversationalIntentService.js`** — deterministic small-talk detection that runs before the
+  cache and retrieval. It matches the *whole* normalised question, never a substring, so "Hi, who is
+  the author?" still goes through RAG.
 - **`promptService.js`** — owns `SYSTEM_PROMPT` and `NO_ANSWER_REPLY` (the exact fallback string,
   which must stay identical to the wording inside the system prompt). Context is wrapped in
   `<<<CONTEXT_START>>>` / `<<<CONTEXT_END>>>` markers, and `sanitiseText` strips control characters,
@@ -241,13 +283,15 @@ execute for real without network access. Keep new services in this shape.
   returns nothing, rather than spending a model call on empty context. Sends `max_tokens:
   CHAT_MAX_OUTPUT_TOKENS` (both the normal call and the temperature-fallback retry) to bound
   worst-case generation time — most load-bearing on CPU-only local Ollama inference, where output
-  length dominates latency. Citations include `page`/`pageEnd` alongside `chunkId`/`score`.
+  length dominates latency. Citations include `page`/`pageEnd` alongside `chunkId`/`score`. The
+  response cache is invalidated only by its TTL: the service has no dependency on the indexer, so
+  after a `/index-book` re-index, repeated questions can return stale answers for up to 10 minutes.
 - **`indexService.js`** — a module-level in-flight guard rejects a concurrent `/index-book` with
   409 rather than interleaving writes to the same deterministic IDs.
 
 ### Temperature fallback
 
-`chatService` sends `temperature: 0.2`, but some newer OpenAI models accept only their default and
+`chatService` sends an explicit `temperature` (`CHAT_TEMPERATURE`, default 0.2), but some newer OpenAI models accept only their default and
 reject an explicit value with a 400. That specific error triggers one retry without the parameter;
 all other errors propagate untouched.
 
@@ -281,11 +325,29 @@ beyond React: the Markdown renderer is hand-written (`components/Markdown.tsx`) 
 Layering, strictly enforced — no business logic in components:
 
 ```
-services/chatApi.ts   fetch, timeout, HTTP status → ChatApiError (retryable flag)
+services/chatApi.ts   fetch + SSE parsing (streamQuestion), timeout, HTTP status → ChatApiError (retryable flag)
 hooks/useChat.ts      messages, loading, error state; owns the request lifecycle
+services/speechRecognition.ts / speechSynthesis.ts   Web Speech API wrappers
+hooks/useVoice.ts     idle→listening→thinking→speaking state machine, wired to useChat
 components/*          presentational only, driven by props
 pages/ChatPage.tsx    composition + autoscroll
 ```
+
+**Voice input/output** (`useVoice.ts`, `VoiceControls.tsx`) layers on top of the existing text
+pipeline rather than replacing it — `onFinalTranscript` calls straight into `useChat`'s `send`, so a
+spoken question produces the exact same request and message bubble a typed one would; `useVoice`
+never calls `/chat` itself. `speechRecognition.ts`/`speechSynthesis.ts` wrap the browser's native Web
+Speech API (`SpeechRecognition`/`webkitSpeechRecognition`, `window.speechSynthesis`) behind a
+provider-agnostic controller shape, so swapping in a cloud STT/TTS provider later means writing a new
+file with the same shape, not touching the hook or UI. `pendingVoiceTurnRef` gates speaking the
+answer aloud so a *typed* question's response is never read out; `isSpeechToTextSupported` /
+`isTextToSpeechSupported` feature-detect independently, and `VoiceControls` disappears entirely (not
+just disabled) when STT is unsupported. A `LISTENING_WATCHDOG_MS` (12s) timeout exists because some
+platforms fire neither a result nor `onerror` on a stuck permission prompt or a silent mic block, so
+without it "Listening…" could hang forever. Every recognition lifecycle event logs a
+`[VOICE]`-prefixed console line — deliberate temporary diagnostic instrumentation for a
+"microphone isn't picking up speech" investigation; safe to trim once voice is confirmed working
+end-to-end.
 
 `vite.config.ts` proxies `/chat` to `localhost:3000`, so the browser stays same-origin and the
 Express server needs no CORS handling. Changing the backend port means changing the proxy target too.

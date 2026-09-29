@@ -74,6 +74,14 @@ function buildConfig() {
       // nomic-embed-text produces 768-dim vectors.
       embeddingDimensions: readInt("OLLAMA_EMBEDDING_DIMENSIONS", 768, { min: 1, max: 8192 }),
       timeoutMs: readInt("OLLAMA_TIMEOUT_MS", 120_000, { min: 1_000, max: 600_000 }),
+      // Keeps the model resident this long after the last request, so a gap
+      // longer than Ollama's own default unload window doesn't pay the
+      // ~12s cold-load cost again on the next question (server.js's warm-up
+      // only covers the very first request after boot, not later idle gaps).
+      // Best-effort: only sent when talking to Ollama, and only takes effect
+      // if Ollama's OpenAI-compatible endpoint honours the field — harmless
+      // if it's silently ignored.
+      keepAlive: readString("OLLAMA_KEEP_ALIVE", "30m"),
     },
 
     qdrant: {
@@ -116,6 +124,15 @@ function buildConfig() {
       // nothing stopping a rambling answer from running for as long as its
       // context window allows. Applies to whichever provider is active.
       maxOutputTokens: readInt("CHAT_MAX_OUTPUT_TOKENS", 500, { min: 50, max: 8000 }),
+      // Unset (the default) leaves sampling exactly as before. A fixed seed
+      // removes one source of run-to-run answer variance between identical
+      // questions — measurably relevant on a small local model at a nonzero
+      // temperature, where the same question can otherwise attribute a fact
+      // to a different person from one run to the next.
+      seed:
+        process.env.CHAT_SEED !== undefined && process.env.CHAT_SEED !== ""
+          ? readInt("CHAT_SEED", 0, { min: 0, max: 2_147_483_647 })
+          : undefined,
     },
   };
 
@@ -141,6 +158,10 @@ function buildConfig() {
     // Ollama's OpenAI-compatible surface lives under /v1. Left undefined for the
     // real OpenAI provider so the SDK uses its own default.
     baseUrl: llmProvider === "ollama" ? `${config.ollama.baseUrl}/v1` : undefined,
+    seed: config.chat.seed,
+    // Only meaningful for Ollama; left undefined for OpenAI so the field is
+    // never sent to the real API.
+    keepAlive: llmProvider === "ollama" ? config.ollama.keepAlive : undefined,
   };
 
   return config;

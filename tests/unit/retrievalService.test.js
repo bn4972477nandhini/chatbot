@@ -195,6 +195,65 @@ describe("retrievalService", () => {
     assert.equal(chunks[0].chunkId, 1, "the structured-data chunk outranks a near-tied generic one");
   });
 
+  it("promotes a chunk with an inline 'Label: Value' line (not a flattened table) ahead of a near-tied generic chunk", async () => {
+    // Real bug found against founder.pdf: a copyright page states
+    // "Author: Sakthivel Pannerselvam" as ordinary prose, not the wide-gap
+    // flattened-table shape labelValueExtractor.js looks for, so
+    // hasStructuredData is never set for it — the chunk got no ranking credit
+    // for carrying an explicit, on-point label at all. Generic fixture (not
+    // the real book's wording): any capitalized "Label: Value" line should
+    // earn the same small directness nudge hasStructuredData already gets.
+    const labelled = point(1, 0.58, [0.9, 0.1]);
+    labelled.payload.pageContent = "Copyright page. Author: Jordan Blake. All rights reserved.";
+    const generic = point(2, 0.60, [0.1, 0.9]);
+    const filler = Array.from({ length: 5 }, (_, i) => point(10 + i, 0.55, [0, 1 + i * 1e-6]));
+
+    const { service } = build({ points: [labelled, generic, ...filler] });
+
+    const { chunks } = await service.retrieve("q", { limit: 5, useMmr: true });
+
+    assert.equal(chunks[0].chunkId, 1, "the inline-label chunk outranks a near-tied generic one");
+  });
+
+  it("guarantees a slot for a directly-labelled evidence chunk MMR would otherwise diversity-penalize out entirely", async () => {
+    // Real bug found against founder.pdf: "Who wrote this book?" ranked the
+    // copyright page's "Author: X" chunk outside MMR's diversity-adjusted
+    // top-k even though it was in the candidate pool with a perfectly
+    // reasonable score — the directness bonus alone cannot help here, since
+    // it only re-ranks chunks MMR already selected, it cannot rescue one MMR
+    // excluded. A guaranteed slot (the same mechanism lexical/expansion
+    // matches already get) is needed to make sure this evidence is actually
+    // seen, not just correctly ordered once present.
+    const authorChunk = point(0, 0.5, [0.9, 0.1]); // similar vector to neighbour...
+    authorChunk.payload.pageContent = "Copyright page. Author: Sakthivel Pannerselvam.";
+    const neighbour = point(5, 0.7, [0.91, 0.09]); // ...ranks higher, would normally win MMR's slot
+    const filler = Array.from({ length: 6 }, (_, i) => point(10 + i, 0.6, [0, 1 + i * 1e-6]));
+
+    const { service } = build({ points: [neighbour, authorChunk, ...filler] });
+
+    const { chunks } = await service.retrieve("q", { limit: 7, useMmr: true });
+
+    assert.ok(
+      chunks.some((c) => c.chunkId === 0),
+      "the directly-labelled chunk survives MMR selection via its guaranteed slot"
+    );
+  });
+
+  it("does not credit an ordinary mid-sentence colon as an inline label", async () => {
+    // The inline-label detector requires the value to start with a capital
+    // letter or digit, precisely so it does not fire on prose like this.
+    const midSentence = point(1, 0.58, [0.9, 0.1]);
+    midSentence.payload.pageContent = "He said: it was a great success for everyone involved that year.";
+    const generic = point(2, 0.60, [0.1, 0.9]);
+    const filler = Array.from({ length: 5 }, (_, i) => point(10 + i, 0.55, [0, 1 + i * 1e-6]));
+
+    const { service } = build({ points: [midSentence, generic, ...filler] });
+
+    const { chunks } = await service.retrieve("q", { limit: 5, useMmr: true });
+
+    assert.equal(chunks[0].chunkId, 2, "an ordinary mid-sentence colon earns no directness nudge");
+  });
+
   it("widens the candidate pool when MMR is on", async () => {
     const { service, calls } = build({ points: [] });
 
@@ -617,6 +676,34 @@ describe("retrievalService — query expansion", () => {
     await service.retrieve("Who is the author?", { useMmr: false, useQueryExpansion: true });
 
     assert.equal(expandQueryCalls.length, 1, "expandQuery still runs when nothing already confirms the top hit");
+  });
+
+  it("does not treat a single incidental keyword match as full lexical confirmation", async () => {
+    // Real bug found against founder.pdf: "What's the writer's identity?"
+    // extracts ["writer", "identity"]. The dense pass's top hit was the
+    // acknowledgments page, which contains "writer" only because it credits
+    // an unrelated person's own job title ("Content Writer") — never
+    // "identity" anywhere. A BM25 pass over both keywords together still
+    // scores that chunk above zero (BM25 sums per-term scores; it does not
+    // require every term to hit), so the old membership-only check wrongly
+    // treated one matched keyword out of two as full agreement and skipped
+    // the paraphrase that would have found the book's actual "Author: X"
+    // chunk. One matched keyword out of two extracted must not suppress it.
+    const acknowledgmentsChunk = point(1, 0.6, [1, 0]);
+    acknowledgmentsChunk.payload.pageContent =
+      "Dhivya Balaji, Editor, Author & Content Writer, Founder of a literary services company.";
+
+    const { service, expandQueryCalls } = buildWithExpansion({
+      onSearch: (options) => (options.limit === VARIANT_LIMIT ? [] : [acknowledgmentsChunk]),
+      expandQuery: () => ["a paraphrase"],
+    });
+
+    await service.retrieve("What's the writer's identity?", {
+      useMmr: false,
+      useQueryExpansion: true,
+    });
+
+    assert.equal(expandQueryCalls.length, 1, "still runs the paraphrase despite the one-keyword coincidence");
   });
 
   it("promotes a chunk that a paraphrase ranks well, above one only the original phrasing found", async () => {

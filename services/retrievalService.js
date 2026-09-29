@@ -42,6 +42,20 @@ const MIN_KEYWORD_LENGTH = 4;
 const FALLBACK_POOL_SIZE = 100;
 const FALLBACK_MATCH_COUNT = 10;
 
+// An explicit "Label: Value" line inline in ordinary prose (e.g. a copyright
+// page's "Author: Jane Doe") is exactly the same kind of direct, on-point
+// evidence hasStructuredData already rewards — it just isn't the wide-gap
+// flattened-table shape labelValueExtractor.js looks for, so the indexer
+// never flags it. Generic (any capitalized label word, not tied to "Author"
+// or any one book), and deliberately narrow: requires the value to start
+// with a capital letter or digit, so it does not fire on an ordinary
+// mid-sentence colon. Checked against the real indexed book: matches 15/87
+// chunks, 14 of which are already-flagged "SPENT: Rs..." lines this changes
+// nothing for; the one new match is the "Author: Sakthivel Pannerselvam"
+// copyright-page line.
+const INLINE_LABEL_VALUE_RE = /\b[A-Z][a-zA-Z]{2,20}\s*:\s*[A-Z0-9]/;
+const hasInlineLabelValue = (point) => INLINE_LABEL_VALUE_RE.test(point.payload?.pageContent ?? "");
+
 /**
  * Pulls the distinctive words out of a question — lowercased, punctuation
  * stripped, stopwords and short filler words removed. Exported for testing.
@@ -234,9 +248,41 @@ function createRetrievalService({
     // signals do NOT already agree — no keyword overlap at all, or the
     // keyword match lands on a different chunk than the dense pass's top pick
     // — expansion still runs exactly as before.
-    const topDenseKey = densePoints.length > 0 ? keyOf(densePoints[0]) : null;
+    // A BM25 pass can rank the top dense chunk into its results off a single
+    // matched keyword among several extracted from the question — BM25 sums
+    // per-term scores, it does not require every term to hit. Real case found
+    // against founder.pdf: "What's the writer's identity?" extracts ["writer",
+    // "identity"], and the acknowledgments chunk (which only happens to
+    // describe a different person's job title as "Content Writer") matched on
+    // "writer" alone and was wrongly treated as agreeing with the dense pass —
+    // which suppressed the paraphrase rescue that would have found the book's
+    // actual "Author: X" chunk. Requiring every extracted keyword to appear in
+    // the top chunk's own text (not just that chunk's membership in a pooled,
+    // multi-keyword BM25 ranking) is a stronger check for genuine agreement,
+    // and needs no extra Qdrant/BM25 round trip.
+    const topDensePoint = densePoints.length > 0 ? densePoints[0] : null;
+    const topDenseKey = topDensePoint != null ? keyOf(topDensePoint) : null;
+    const topDenseText = (topDensePoint?.payload?.pageContent ?? "").toLowerCase();
+    const matchedKeywordCount = keywords.filter((keyword) => topDenseText.includes(keyword)).length;
+    // A short, generic question (few extracted keywords) makes "most of them
+    // matched" too easy to satisfy by chance to mean anything — e.g. matching
+    // 1 of 2 keywords is not real corroboration (measured: this is exactly
+    // the shape of "What's the writer's identity?", which must keep requiring
+    // every keyword to match). Only once there are enough distinctive
+    // keywords (>=4) does a majority match become a genuine, distinguishing
+    // confidence signal rather than noise — measured against the real book,
+    // this safely confirms a clearly on-topic, highly-scored dense hit like
+    // "How much was spent on the first campaign at the IIT Chennai fest?"
+    // (5 of 8 keywords, 0.77 dense score) without also confirming weakly-
+    // matched, still-ambiguous cases like the salon-campaign trap question
+    // (1 of 3) or "Who is the author and what is his profession?" (1 of 2,
+    // below the 4-keyword floor). Below the floor, the original all-or-
+    // nothing rule still applies unchanged.
     const isTopDenseChunkLexicallyConfirmed =
-      topDenseKey != null && lexicalMatches.some((point) => keyOf(point) === topDenseKey);
+      topDenseKey != null &&
+      keywords.length > 0 &&
+      (matchedKeywordCount === keywords.length ||
+        (keywords.length >= 4 && matchedKeywordCount >= Math.ceil(keywords.length / 2)));
 
     // Paraphrase signal: a chunk dense search ranks reasonably for the
     // question as asked, but not prominently, can rank clearly higher for a
@@ -249,12 +295,24 @@ function createRetrievalService({
     // purpose (measured: a real rescue chunk scored 0.516 and 0.502 against
     // two variants, both just under a 0.52 threshold). Unfiltered like the
     // wide pool, and gated the same way: only contributed when the original
-    // dense pass already found something plausible, so an off-topic
-    // question's paraphrases can't resurrect irrelevant chunks just by
-    // asking again — this is a "best guess" signal, not independent proof of
-    // relevance, exactly like the wide pool's raw-similarity signal above.
+    // dense pass already found something plausible, OR the question has its
+    // own distinctive keywords (the same `shouldWiden` gate widening itself
+    // uses) — so an off-topic question with neither still can't trigger a
+    // paraphrase. This is wider than the raw-similarity signal's gate just
+    // above, which stays strictly dense-only: raw similarity resurrects a
+    // chunk with no further check, so it needs real dense evidence to trust;
+    // a paraphrase instead runs a fresh, real search of its own, so a
+    // genuinely off-topic keyword-bearing question still comes up empty and
+    // declines correctly (verified: the variant searches find nothing either,
+    // exactly like the original ones did). Real case found against
+    // founder.pdf: "What's the writer's identity?" has keywords but the
+    // narrow dense pass clears zero results at all (its best raw score fell
+    // just under scoreThreshold) — under the old dense-only gate this
+    // silently fell back to lexical-only evidence and could never reach the
+    // book's actual "Author: X" chunk, which shares no keyword with the
+    // question, no matter how the question was phrased.
     const expansionStartedAt = Date.now();
-    if (useQueryExpansion && densePoints.length > 0 && !isTopDenseChunkLexicallyConfirmed) {
+    if (useQueryExpansion && shouldWiden && !isTopDenseChunkLexicallyConfirmed) {
       const variants = await expandQuery(question).catch(() => []);
       expandedQueryCount = variants.length;
 
@@ -368,6 +426,44 @@ function createRetrievalService({
             if (guaranteedCorroborated.length === before) exhausted = true;
           }
 
+          // A chunk carrying an explicit LABEL: value line (the indexer's own
+          // hasStructuredData flag, or the inline "Author: Name" pattern
+          // detected above) is as strong, on-point evidence as a lexical or
+          // expansion match — but unlike those, nothing previously guaranteed
+          // it a slot, so MMR's diversity trade-off could (and, on a real
+          // "who wrote this book?" query against this book, did) leave it out
+          // of the final selection entirely even though it sat in the
+          // candidate pool the whole time with a perfectly good score; the
+          // directness bonus below could only ever re-rank a chunk MMR had
+          // already chosen, not rescue one it hadn't. One such runner-up is
+          // carried through the same way a lexical match is.
+          //
+          // Deliberately narrower than the directness *bonus* just below:
+          // this only guarantees the inline-label case (e.g. "Author: X"),
+          // not the indexer's pre-existing hasStructuredData flag. That flag
+          // already matches 14 different campaigns' SPENT/REACH/ROI chunks
+          // across the book — guaranteeing a slot for "any hasStructuredData
+          // chunk in the pool" pulled in whichever one happened to rank
+          // within the wide pool, not necessarily the one relevant to the
+          // question actually asked, and measurably displaced a genuinely
+          // useful narrative chunk on a real "how much was spent on the first
+          // campaign at IIT Chennai" query. hasStructuredData chunks are
+          // already well served by dense ranking plus the existing
+          // STRUCTURED_NUMERIC_BONUS re-ranking below; only the inline-label
+          // case — novel this change, and far rarer (1 real match in the
+          // whole book, see hasInlineLabelValue above) — lacked any
+          // guarantee at all before this.
+          const directEvidenceGuaranteeCount = Math.min(1, Math.floor(limit / 5));
+          const guaranteedDirectEvidence = candidatePoints
+            .filter(
+              (point) =>
+                needsRescue(point) &&
+                !guaranteedCorroboratedKeys.has(keyOf(point)) &&
+                hasInlineLabelValue(point)
+            )
+            .slice(0, directEvidenceGuaranteeCount);
+          const guaranteedDirectEvidenceKeys = new Set(guaranteedDirectEvidence.map(keyOf));
+
           // A chunk sharing the single best-ranked candidate's `section` is
           // structurally part of the same narrative unit (e.g. a campaign's
           // SPENT/REACH/ROI summary a page or two after the story that earned
@@ -387,14 +483,17 @@ function createRetrievalService({
                   .slice(1)
                   .filter(
                     (point) =>
-                      point.payload?.section === topSection && !guaranteedCorroboratedKeys.has(keyOf(point))
+                      point.payload?.section === topSection &&
+                      !guaranteedCorroboratedKeys.has(keyOf(point)) &&
+                      !guaranteedDirectEvidenceKeys.has(keyOf(point))
                   )
                   .slice(0, sectionGuaranteeCount);
 
-          const guaranteed = [...guaranteedCorroborated, ...guaranteedSection].slice(
-            0,
-            Math.max(0, limit - 1)
-          );
+          const guaranteed = [
+            ...guaranteedCorroborated,
+            ...guaranteedDirectEvidence,
+            ...guaranteedSection,
+          ].slice(0, Math.max(0, limit - 1));
           const guaranteedKeys = new Set(guaranteed.map(keyOf));
 
           const remaining = maximalMarginalRelevance({
@@ -443,7 +542,10 @@ function createRetrievalService({
             if (point.payload?.hasStructuredData === true) {
               return questionIsNumeric ? STRUCTURED_NUMERIC_BONUS : DIRECTNESS_BONUS;
             }
-            return lexicalMatchKeys.has(keyOf(point)) ? DIRECTNESS_BONUS : 0;
+            if (lexicalMatchKeys.has(keyOf(point)) || hasInlineLabelValue(point)) {
+              return DIRECTNESS_BONUS;
+            }
+            return 0;
           };
           const effectiveScore = (point) => (point.score ?? 0) + directnessBonus(point);
 

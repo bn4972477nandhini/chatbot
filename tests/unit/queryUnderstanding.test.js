@@ -7,6 +7,7 @@ const {
   isPersonQuestion,
   isMultiPart,
   isShortQuestion,
+  isAbstractQuestion,
   classifyQuestion,
 } = require("../../services/queryUnderstanding");
 
@@ -82,10 +83,26 @@ describe("queryUnderstanding", () => {
     });
   });
 
+  describe("isAbstractQuestion", () => {
+    it("detects a whole-book summary request", () => {
+      assert.ok(isAbstractQuestion("Summarize the key ideas of the book."));
+      assert.ok(isAbstractQuestion("What is the main message of the book?"));
+      assert.ok(isAbstractQuestion("Give me an overview of the book."));
+      assert.ok(isAbstractQuestion("What's the gist of this book?"));
+    });
+
+    it("does not flag an ordinary specific-fact question", () => {
+      assert.equal(isAbstractQuestion("Who is the author of this book?"), false);
+      assert.equal(isAbstractQuestion("How much was spent on the campaign?"), false);
+      assert.equal(isAbstractQuestion("What does guerrilla marketing mean?"), false);
+    });
+  });
+
   describe("classifyQuestion", () => {
     it("bundles every detector into one object", () => {
       const result = classifyQuestion("Who is author?");
       assert.deepEqual(Object.keys(result).sort(), [
+        "isAbstract",
         "isMultiPart",
         "isNumeric",
         "isPerson",

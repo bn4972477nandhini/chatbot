@@ -75,6 +75,52 @@ describe("embeddingService", () => {
     assert.equal(client.calls.embeddings.length, 3);
   });
 
+  it("aborts a hung embeddings call within the configured timeout, rather than hanging", async () => {
+    // Never resolves or rejects on its own — models the real incident this
+    // guards against: query-expansion's variant-embedding call hung for
+    // several minutes because only the client's constructor-level timeout
+    // covered it, and that alone did not reliably enforce the deadline. Only
+    // settles when the signal we were given fires, so a pass here proves the
+    // explicit per-request AbortSignal is what ends the call.
+    const client = {
+      embeddings: {
+        create: (params, { signal }) =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new Error("The operation was aborted.")));
+          }),
+      },
+    };
+    const service = createEmbeddingService({ getClient: () => client, timeoutMs: 50 });
+
+    const startedAt = Date.now();
+    await assert.rejects(() => service.embedTexts(["a"]));
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(
+      elapsedMs < 2000,
+      `expected the hung call to abort near the configured 50ms timeout, took ${elapsedMs}ms`
+    );
+  });
+
+  it("does not retry a request that timed out on its own hard deadline", async () => {
+    let calls = 0;
+    const client = {
+      embeddings: {
+        create: (params, { signal }) => {
+          calls++;
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" })));
+          });
+        },
+      },
+    };
+    const service = createEmbeddingService({ getClient: () => client, timeoutMs: 30 });
+
+    await assert.rejects(() => service.embedTexts(["a"]));
+
+    assert.equal(calls, 1, "a self-inflicted timeout is not worth retrying — it would only multiply the wait");
+  });
+
   it("serves a repeated question from cache", async () => {
     const { client, service } = build();
 
