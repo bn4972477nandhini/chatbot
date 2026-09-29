@@ -160,10 +160,16 @@ default `30m`); an optional `CHAT_SEED` pins sampling for reproducible evals.
 Both it and the Qdrant client are built **lazily** on first use. Both expose `setOpenAIClient` /
 `setQdrantClient` as test seams.
 
-`server.js` fires a one-token warm-up completion against `config.llm.chatModel` right after
-`app.listen`, but only when `config.llm.provider === "ollama"` — a cold Ollama model load measured
-at ~12.5s would otherwise land on whichever user asks the first real question. Fire-and-forget:
-failure is logged and swallowed, never blocks startup or delays `/health`.
+`server.js` builds the one `chatService` itself, passes it to `createApp`, and calls
+`chatService.warmUp()` right after `app.listen`, but only when `config.llm.provider === "ollama"`.
+The warm-up is a one-token completion built by the same `buildMessages` and `completionExtras()`
+as real requests. That makes its system message and prompt prefix byte-identical, so Ollama
+reuses the already-processed prefix on the first real question: on CPU, reading the ~1,000-token
+system prompt is most of a request's time. It also sends the same `keep_alive`, so the model isn't
+unloaded after Ollama's default 5 minutes. Don't give the warm-up its own prompt or options.
+Fire-and-forget: failure is logged and swallowed, never blocks startup or delays `/health`. On
+the 3B model the warm-up itself takes about 40 s, and a question asked during that time waits
+behind it in the FIFO queue.
 
 ### Dependency injection
 

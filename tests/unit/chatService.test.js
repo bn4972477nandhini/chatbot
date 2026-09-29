@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
 
 const { createChatService } = require("../../services/chatService");
-const { NO_ANSWER_REPLY } = require("../../services/promptService");
+const { NO_ANSWER_REPLY, CONTEXT_START } = require("../../services/promptService");
 const { createMockOpenAI, createTestLogger } = require("../helpers/mocks");
 
 const chunk = (chunkId, score, page = chunkId) => ({
@@ -525,5 +525,56 @@ describe("chatService", () => {
       assert.equal(client.calls.length, 1, "ask() after askStream() for the same question is a cache hit");
       assert.deepEqual(buffered, streamed);
     });
+  });
+});
+
+describe("warmUp", () => {
+  it("requests a single token and never touches retrieval", async () => {
+    let retrieved = false;
+    const openai = createMockOpenAI();
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => {
+          retrieved = true;
+          return { chunks: [], timings: {} };
+        },
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+
+    await service.warmUp();
+
+    assert.equal(openai.calls.chat.length, 1);
+    assert.equal(openai.calls.chat[0].max_tokens, 1);
+    assert.equal(retrieved, false);
+  });
+
+  // keep_alive/seed equality is asserted in chatServiceWarmupOllama.test.js,
+  // where the Ollama provider actually sends them.
+  it("shares the real request's system message, prompt prefix and model, so Ollama can reuse the prefill", async () => {
+    const { service, openai } = build();
+
+    await service.warmUp();
+    await service.ask("Who wrote this book?");
+
+    const [warm, real] = openai.calls.chat;
+    const contextPrefix = `Context:\n\n${CONTEXT_START}\n`;
+
+    assert.equal(warm.model, real.model);
+    assert.deepEqual(warm.messages[0], real.messages[0]);
+    assert.equal(warm.messages[0].role, "system");
+    assert.ok(warm.messages[1].content.startsWith(contextPrefix));
+    assert.ok(real.messages[1].content.startsWith(contextPrefix));
+  });
+
+  it("propagates a client failure so the caller can log it", async () => {
+    const openai = createMockOpenAI();
+    openai.chat.completions.create = async () => {
+      throw new Error("connect ECONNREFUSED");
+    };
+    const { service } = build({ client: openai });
+
+    await assert.rejects(service.warmUp(), /ECONNREFUSED/);
   });
 });
