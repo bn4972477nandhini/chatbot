@@ -301,16 +301,34 @@ function createRetrievalService({
     // paraphrase. This is wider than the raw-similarity signal's gate just
     // above, which stays strictly dense-only: raw similarity resurrects a
     // chunk with no further check, so it needs real dense evidence to trust;
-    // a paraphrase instead runs a fresh, real search of its own, so a
-    // genuinely off-topic keyword-bearing question still comes up empty and
-    // declines correctly (verified: the variant searches find nothing either,
-    // exactly like the original ones did). Real case found against
+    // a paraphrase instead runs a fresh, real search of its own. That search
+    // is unfiltered (scoreThreshold 0) and so always returns its nearest
+    // chunks, which is why it's held to the normal threshold when the
+    // original question produced no evidence at all (see
+    // `hasOriginalEvidence` below). Real case found against
     // founder.pdf: "What's the writer's identity?" has keywords but the
     // narrow dense pass clears zero results at all (its best raw score fell
     // just under scoreThreshold) — under the old dense-only gate this
     // silently fell back to lexical-only evidence and could never reach the
     // book's actual "Author: X" chunk, which shares no keyword with the
     // question, no matter how the question was phrased.
+    // When the question as asked found nothing at all — no chunk cleared
+    // scoreThreshold and no chunk contains any of its keywords — a paraphrase
+    // is the only evidence left, and an unfiltered variant search always
+    // returns its nearest chunks however unrelated. Measured against the real
+    // book: the three off-topic eval questions (capital of France, pizza
+    // dough, US president) are exactly the questions with no evidence, and
+    // their best paraphrase matches over 9 live runs peaked at 0.500 — so
+    // they reached the model with irrelevant passages and spent ~40s reading
+    // them only to decline. In that case a paraphrase hit must clear the same
+    // threshold the question itself would have had to. Whenever the original
+    // question produced any evidence (every real question in the eval,
+    // including the "What's the writer's identity?" rescue, which has keyword
+    // hits), variant searches stay unfiltered exactly as before, so a rescue
+    // chunk scoring just under the threshold is still reachable.
+    const hasOriginalEvidence = densePoints.length > 0 || lexicalMatches.length > 0;
+    const variantScoreThreshold = hasOriginalEvidence ? 0 : scoreThreshold;
+
     const expansionStartedAt = Date.now();
     if (useQueryExpansion && shouldWiden && !isTopDenseChunkLexicallyConfirmed) {
       const variants = await expandQuery(question).catch(() => []);
@@ -330,7 +348,7 @@ function createRetrievalService({
           variantVectors.map((variantVector) =>
             searchPoints(variantVector, {
               limit: FALLBACK_MATCH_COUNT,
-              scoreThreshold: 0,
+              scoreThreshold: variantScoreThreshold,
               withPayload: true,
               withVector: useMmr,
               filter,

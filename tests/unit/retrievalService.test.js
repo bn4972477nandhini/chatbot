@@ -1003,3 +1003,87 @@ describe("reciprocalRankFusion", () => {
     assert.deepEqual(reciprocalRankFusion([]), []);
   });
 });
+
+describe("paraphrase results when the original question found no evidence", () => {
+  const WIDE_LIMIT = 100;
+  const VARIANT_LIMIT = 10;
+  const THRESHOLD = 0.65; // tests/setup-env.js pins RETRIEVAL_SCORE_THRESHOLD
+
+  function build({ narrow, wide, variant }) {
+    const variantCalls = [];
+    const service = createRetrievalService({
+      embedText: async () => [1, 0],
+      embedTexts: async (texts) => texts.map(() => [1, 0]),
+      searchPoints: async (vector, options) => {
+        if (options.limit === WIDE_LIMIT) return wide;
+        if (options.limit === VARIANT_LIMIT) {
+          variantCalls.push(options);
+          // Mirrors Qdrant: a score_threshold filters out weaker matches.
+          return variant.filter((p) => p.score >= (options.scoreThreshold ?? 0));
+        }
+        return narrow;
+      },
+      expandQuery: async () => ["a paraphrase", "another paraphrase"],
+      logger: createTestLogger(),
+    });
+    return { service, variantCalls };
+  }
+
+  it("holds paraphrase-only matches to the normal threshold, so an off-topic question retrieves nothing", async () => {
+    // Real shape: "What is the capital of France?" — no chunk clears the
+    // threshold and none contains "capital" or "france", yet an unfiltered
+    // paraphrase search always returns the book's nearest (irrelevant) pages.
+    const nearestButIrrelevant = point(24, 0.5, [1, 0]);
+    nearestButIrrelevant.payload.pageContent = "Our team dressed up as ninjas for the festival.";
+    const { service, variantCalls } = build({
+      narrow: [],
+      wide: [nearestButIrrelevant],
+      variant: [nearestButIrrelevant],
+    });
+
+    const { chunks } = await service.retrieve("What is the capital of France?", {
+      useMmr: false,
+      useQueryExpansion: true,
+    });
+
+    assert.equal(variantCalls.length, 2);
+    assert.ok(variantCalls.every((o) => o.scoreThreshold === THRESHOLD));
+    assert.deepEqual(chunks, [], "nothing reaches the model, so the question declines without an LLM call");
+  });
+
+  it("still uses a paraphrase match that clears the threshold on its own", async () => {
+    const strongParaphraseHit = point(3, 0.7, [1, 0]);
+    const { service } = build({ narrow: [], wide: [point(9, 0.3, [1, 0])], variant: [strongParaphraseHit] });
+
+    const { chunks } = await service.retrieve("What is the capital of France?", {
+      useMmr: false,
+      useQueryExpansion: true,
+    });
+
+    assert.ok(chunks.some((c) => c.chunkId === 3));
+  });
+
+  it("keeps paraphrase searches unfiltered when the question has keyword evidence (the writer's-identity rescue)", async () => {
+    // Real shape: "What's the writer's identity?" — no chunk clears the dense
+    // threshold, but the keyword pass matches "writer" on the acknowledgments
+    // page. The book's "Author: X" page is only reachable through a
+    // paraphrase, scoring just under the threshold.
+    const acknowledgments = point(1, 0.49, [1, 0]);
+    acknowledgments.payload.pageContent = "Dhivya Balaji, Editor, Author & Content Writer.";
+    const authorPage = point(0, 0.516, [1, 0]);
+    authorPage.payload.pageContent = "Author: Sakthivel Pannerselvam.";
+    const { service, variantCalls } = build({
+      narrow: [],
+      wide: [acknowledgments],
+      variant: [authorPage],
+    });
+
+    const { chunks } = await service.retrieve("What's the writer's identity?", {
+      useMmr: false,
+      useQueryExpansion: true,
+    });
+
+    assert.ok(variantCalls.every((o) => o.scoreThreshold === 0), "variant searches stay unfiltered");
+    assert.ok(chunks.some((c) => c.chunkId === 0), "the under-threshold author page is still rescued");
+  });
+});
