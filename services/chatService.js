@@ -108,15 +108,24 @@ function createChatService({
     return AbortSignal.timeout(timeoutMs);
   }
 
-  async function createCompletion(messages, log) {
-    const client = getClient();
-    // seed is omitted entirely (rather than sent as undefined) when unset, so
-    // a provider that validates unknown/undefined fields strictly never sees
-    // it; keep_alive is Ollama-only (see config/env.js) and included the same way.
-    const extras = {
+  /**
+   * seed is omitted entirely (rather than sent as undefined) when unset, so a
+   * provider that validates unknown/undefined fields strictly never sees it;
+   * keep_alive is Ollama-only (see config/env.js) and included the same way.
+   * Shared by every call this service makes — including warmUp() — so the
+   * warm-up can never hold the model loaded for a different duration than
+   * real requests do.
+   */
+  function completionExtras() {
+    return {
       ...(SEED !== undefined ? { seed: SEED } : {}),
       ...(KEEP_ALIVE ? { keep_alive: KEEP_ALIVE } : {}),
     };
+  }
+
+  async function createCompletion(messages, log) {
+    const client = getClient();
+    const extras = completionExtras();
 
     try {
       return await client.chat.completions.create(
@@ -164,10 +173,7 @@ function createChatService({
    */
   async function createCompletionStream(messages, log, onDelta, externalSignal) {
     const client = getClient();
-    const extras = {
-      ...(SEED !== undefined ? { seed: SEED } : {}),
-      ...(KEEP_ALIVE ? { keep_alive: KEEP_ALIVE } : {}),
-    };
+    const extras = completionExtras();
     // Combined with the caller's own signal (typically tied to the HTTP
     // client disconnecting) when given, so either the configured hard
     // timeout or an early client disconnect ends the call — a disconnect
@@ -486,7 +492,36 @@ function createChatService({
     return result;
   }
 
-  return { ask, askStream, clearResponseCache: () => responseCache.clear() };
+  /**
+   * Ollama-only: callers gate on `config.llm.provider === "ollama"` (see
+   * server.js). On OpenAI it would only spend a paid completion for nothing.
+   *
+   * Loads the model and pre-processes the prompt prefix every real request
+   * shares, so the first real question after startup doesn't pay for either.
+   * On CPU-only Ollama the ~1,000-token system prompt is roughly half of a
+   * typical request's prompt, and Ollama reuses an already-processed prefix
+   * only when it is byte-identical — hence the messages come from the same
+   * `buildMessages` real requests use (the system message and the start of
+   * the context block match exactly), with the same model and extras.
+   * The reuse holds only while no chat call with a different prefix runs in
+   * between (e.g. query expansion when RETRIEVAL_USE_QUERY_EXPANSION is on).
+   * One output token: the point is the prefill, not an answer.
+   */
+  async function warmUp() {
+    const messages = buildMessages({ question: "warm-up", chunks: [] });
+
+    await getClient().chat.completions.create(
+      {
+        model,
+        max_tokens: 1,
+        ...completionExtras(),
+        messages,
+      },
+      { signal: requestTimeoutSignal() }
+    );
+  }
+
+  return { ask, askStream, warmUp, clearResponseCache: () => responseCache.clear() };
 }
 
 module.exports = { createChatService, CHAT_MODEL, TEMPERATURE };

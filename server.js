@@ -3,9 +3,13 @@ require("dotenv").config();
 const { config, missingCredentials } = require("./config/env");
 const { logger, serialiseError } = require("./lib/logger");
 const { createApp } = require("./app");
-const { getOpenAIClient } = require("./services/openaiClient");
+const { createChatService } = require("./services/chatService");
 
-const app = createApp();
+// Built here rather than inside createApp so the warm-up below goes through
+// the very same service instance — and so the same request shape — that
+// /chat uses.
+const chatService = createChatService();
+const app = createApp({ chatService });
 
 const server = app.listen(config.port, () => {
   const missing = missingCredentials();
@@ -26,19 +30,16 @@ const server = app.listen(config.port, () => {
     });
   }
 
-  // Fires a trivial completion so the model is already resident in Ollama
-  // before the first real request — a cold load measured at ~12.5s would
-  // otherwise land on whichever user asks first. Purely a latency nicety:
-  // failure (Ollama not up yet, wrong provider) is logged and swallowed,
-  // never blocks startup or affects request handling.
+  // Loads the model and pre-processes the shared system prompt before the
+  // first real request, which would otherwise pay a cold load (~12.5s
+  // measured) plus the whole system-prompt prefill on CPU. Sends the same
+  // keep_alive as real requests, so the model stays loaded until the first
+  // question arrives. Purely a latency nicety: failure (Ollama not up yet) is
+  // logged and swallowed, never blocks startup or affects request handling.
   if (config.llm.provider === "ollama") {
     const warmupStartedAt = Date.now();
-    getOpenAIClient()
-      .chat.completions.create({
-        model: config.llm.chatModel,
-        messages: [{ role: "user", content: "hi" }],
-        max_tokens: 1,
-      })
+    chatService
+      .warmUp()
       .then(() => {
         logger.info("model warm-up complete", { durationMs: Date.now() - warmupStartedAt });
       })
