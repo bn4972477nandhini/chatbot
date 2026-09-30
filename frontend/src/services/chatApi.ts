@@ -79,7 +79,24 @@ async function errorFromResponse(response: Response): Promise<ChatApiError> {
     });
   }
 
-  return new ChatApiError(serverMessage ?? GENERIC_ERROR, { status: response.status });
+  if (serverMessage) {
+    return new ChatApiError(serverMessage, { status: response.status });
+  }
+
+  // Every error the Express backend sends is JSON with an `error` field, so a
+  // body without one came from something in front of it — a proxy or gateway
+  // that couldn't reach it. Say so, with the status, rather than a bare
+  // generic line that hides which layer failed.
+  if (response.status === 502 || response.status === 503 || response.status === 504) {
+    return new ChatApiError(
+      `Could not reach the backend (HTTP ${response.status}). Check that it is running on port 3000.`,
+      { status: response.status }
+    );
+  }
+
+  return new ChatApiError(`${GENERIC_ERROR} (HTTP ${response.status})`, {
+    status: response.status,
+  });
 }
 
 export interface StreamCallbacks {

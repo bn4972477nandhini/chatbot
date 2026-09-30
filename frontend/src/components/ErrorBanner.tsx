@@ -1,5 +1,6 @@
 import { memo } from "react";
 import type { ChatError } from "../hooks/useChat";
+import { GENERIC_ERROR } from "../services/chatApi";
 
 interface ErrorBannerProps {
   error: ChatError;
@@ -28,8 +29,10 @@ function ErrorBannerComponent({ error, onRetry, onDismiss, isLoading }: ErrorBan
       </svg>
 
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-red-800">Something went wrong.</p>
-        <p className="mt-0.5 text-sm break-words text-red-700">{error.message}</p>
+        <p className="text-sm font-medium text-red-800">{GENERIC_ERROR}</p>
+        {error.message !== GENERIC_ERROR && (
+          <p className="mt-0.5 text-sm break-words text-red-700">{error.message}</p>
+        )}
 
         <div className="mt-2.5 flex items-center gap-2">
           {error.retryable && (

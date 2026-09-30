@@ -351,6 +351,10 @@ end-to-end.
 
 `vite.config.ts` proxies `/chat` to `localhost:3000`, so the browser stays same-origin and the
 Express server needs no CORS handling. Changing the backend port means changing the proxy target too.
+When the backend isn't running, the proxy's `configure` hook answers a JSON 502 naming the target and
+the socket error (e.g. `ECONNREFUSED`) instead of Vite's empty-bodied reply, so the chat shows the
+real cause. `chatApi.ts` also treats any 502/503/504 without an `{ error }` body as "backend
+unreachable", since every Express error is JSON.
 
 `useChat` returns callbacks with **empty dependency lists** that read mutable state through refs, so
 their identities stay stable and memoised children don't re-render on every request. Preserve that

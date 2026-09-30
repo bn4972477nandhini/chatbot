@@ -112,6 +112,10 @@ export function useChat(): UseChatResult {
         // Cancelled by clear() or unmount — not a failure to surface.
         if (controller.signal.aborted) return;
 
+        // The banner keeps its wording short; the full error (HTTP status,
+        // original exception) goes to the console for debugging.
+        if (import.meta.env.DEV) console.error("[chat] request failed:", caught);
+
         // Whatever streamed in before the failure (if anything) stays visible
         // — losing an already-partially-correct answer on top of the error
         // would be worse than showing both.
