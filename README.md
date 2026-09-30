@@ -92,6 +92,7 @@ also starts a background service listening on `http://localhost:11434`.
 ```powershell
 ollama pull llama3.2          # chat model, ~2GB
 ollama pull nomic-embed-text  # embedding model, ~275MB
+ollama pull llama3.2:1b       # optional: faster, less accurate chat model, ~1.3GB
 ```
 
 **3. Confirm Ollama is reachable.**
@@ -116,6 +117,34 @@ No `OPENAI_API_KEY` needed — `missingCredentials()` in `config/env.js` only re
 
 **5. Start Qdrant, then the app**, as described in [Running](#running). Index the book, then chat —
 same `/index-book` and `/chat` endpoints either way; only the provider behind them changed.
+
+**Faster but less accurate: `llama3.2:1b`.** Set `OLLAMA_LLM_MODEL=llama3.2:1b`, either in `.env` or
+just for one run, since the process environment overrides `.env`:
+
+```
+$env:OLLAMA_LLM_MODEL='llama3.2:1b'; npm start   # PowerShell
+OLLAMA_LLM_MODEL=llama3.2:1b npm start           # POSIX shell
+```
+
+No code change is needed, and neither is a re-index: embeddings stay on `nomic-embed-text`. Both models
+were measured with `scripts/evaluate-chat.js` on a CPU-only 2-core i5 (33 questions, same
+commit, index and `.env`):
+
+| `OLLAMA_LLM_MODEL` | Pass | Median | p90 | Max |
+| --- | --- | --- | --- | --- |
+| `llama3.2` (default) | 30/33 | 59.3 s | 92.0 s | 93.9 s |
+| `llama3.2:1b` | 25/33 | 34.1 s | 49.7 s | 63.0 s |
+
+These numbers came from a local `.env` that differs from `.env.example`: `CHAT_TEMPERATURE=0.1`,
+`CHAT_SEED=7`, `CHAT_MAX_OUTPUT_TOKENS=150` and `RETRIEVAL_USE_QUERY_EXPANSION=true`. During the 1B run,
+outside UI traffic overlapped 4 questions and 1 question failed on a temporary Qdrant error. After
+re-running those 5 questions, 1B scores 26/33 with a 31.9 s median. The full report is
+`_bmad-output/implementation-artifacts/cap-2-model-comparison.md`.
+
+1B takes about 57% of 3B's time. It more often names the wrong person as the author (the editor or the
+foreword writer), and it declines less reliably: it made up a spend figure for the salon trap question
+and refused 2 of 3 off-topic questions in its own words instead of the fallback reply. For now 3B stays
+the default.
 
 Want a stronger model and have the RAM for it? `ollama pull llama3.1:8b` and set
 `OLLAMA_LLM_MODEL=llama3.1:8b`. Any model pulled into Ollama works — the chat quality/speed tradeoff
@@ -154,7 +183,7 @@ precise message rather than at first request.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama's HTTP API; `/v1` is appended automatically |
-| `OLLAMA_LLM_MODEL` | `llama3.2` | Chat model — must be `ollama pull`ed first |
+| `OLLAMA_LLM_MODEL` | `llama3.2` | Chat model — must be `ollama pull`ed first. `llama3.2:1b` is about 1.7× faster but less accurate (see above) |
 | `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model — must be `ollama pull`ed first |
 | `OLLAMA_EMBEDDING_DIMENSIONS` | `768` | Must match the model; changing it requires a fresh collection |
 | `OLLAMA_TIMEOUT_MS` | `120000` | Per-request timeout — local inference is slower than a hosted API |
