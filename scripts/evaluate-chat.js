@@ -12,6 +12,7 @@
  * Usage: node scripts/evaluate-chat.js [--base=http://localhost:3000]
  *        node scripts/evaluate-chat.js --range=1-6 --out=eval-batch1.json
  *        node scripts/evaluate-chat.js --regression
+ *        node scripts/evaluate-chat.js --stream
  *
  * --range=START-END (1-indexed, inclusive) restricts the run to a slice of
  * QUESTIONS below — for running the full set as several short-lived
@@ -21,6 +22,10 @@
  * --regression runs REGRESSION_QUESTIONS (the salon/raincoat attribution
  * lock-in set) instead of the 33-question QUESTIONS set; --range still
  * applies within whichever pool is selected.
+ * --stream sends `stream: true` and reconstructs {answer, citations} from the
+ * SSE frames instead of reading a plain JSON body, so the exact same
+ * grade()/reporting logic verifies accuracy over the streaming path. Also
+ * records firstTokenMs (time to the first `token` event) per question.
  */
 const { NO_ANSWER_REPLY } = require("../services/promptService");
 
@@ -136,7 +141,70 @@ async function askChat(question) {
     body: JSON.stringify({ question }),
   });
   const body = await response.json();
-  return { status: response.status, body };
+  return { status: response.status, body, firstTokenMs: null };
+}
+
+/**
+ * Same contract as askChat, but over the streaming (`stream: true`) path —
+ * reconstructs {answer, citations} from the SSE frames so the exact same
+ * grade()/reporting logic below can verify accuracy is unaffected by
+ * streaming, without a second, parallel benchmarking tool. Also captures
+ * firstTokenMs (time to the first `token` event), which the JSON path has no
+ * equivalent of.
+ */
+async function askChatStream(question) {
+  const startedAt = Date.now();
+  const response = await fetch(`${BASE_URL}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, stream: true }),
+  });
+
+  if (response.status !== 200) {
+    const body = await response.json().catch(() => null);
+    return { status: response.status, body, firstTokenMs: null };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let citations = [];
+  let firstTokenMs = null;
+  let errorMessage = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const rawFrame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+      if (!rawFrame.trim()) continue;
+
+      const eventLine = rawFrame.split("\n").find((l) => l.startsWith("event: "));
+      const dataLine = rawFrame.split("\n").find((l) => l.startsWith("data: "));
+      if (!eventLine || !dataLine) continue;
+
+      const event = eventLine.slice("event: ".length);
+      const data = JSON.parse(dataLine.slice("data: ".length));
+
+      if (event === "citations") {
+        citations = data.citations ?? [];
+      } else if (event === "token") {
+        if (firstTokenMs === null) firstTokenMs = Date.now() - startedAt;
+        answer += data.delta ?? "";
+      } else if (event === "error") {
+        errorMessage = data.message;
+      }
+    }
+  }
+
+  if (errorMessage) return { status: 502, body: { error: errorMessage }, firstTokenMs };
+  return { status: 200, body: { answer, citations }, firstTokenMs };
 }
 
 /**
@@ -171,6 +239,7 @@ function grade(item, answer, citations) {
 }
 
 const REGRESSION_ARG = process.argv.includes("--regression");
+const STREAM_ARG = process.argv.includes("--stream");
 
 function resolveQuestions() {
   const pool = REGRESSION_ARG ? REGRESSION_QUESTIONS : QUESTIONS;
@@ -205,11 +274,13 @@ async function main() {
     const startedAt = Date.now();
     let outcome;
     try {
-      const { status, body } = await askChat(item.question);
+      const { status, body, firstTokenMs } = STREAM_ARG
+        ? await askChatStream(item.question)
+        : await askChat(item.question);
       const elapsedMs = Date.now() - startedAt;
 
       if (status !== 200) {
-        outcome = { ...item, pass: false, status, error: body?.error, elapsedMs };
+        outcome = { ...item, pass: false, status, error: body?.error, elapsedMs, firstTokenMs };
       } else {
         const gradeResult = grade(item, body.answer, body.citations ?? []);
         outcome = {
@@ -219,6 +290,7 @@ async function main() {
           answer: body.answer,
           citations: body.citations,
           elapsedMs,
+          firstTokenMs,
         };
       }
     } catch (error) {
@@ -228,7 +300,8 @@ async function main() {
     results.push(outcome);
 
     const mark = outcome.pass ? "PASS" : "FAIL";
-    console.log(`[${mark}] (${outcome.elapsedMs}ms) ${item.id} — ${item.category} — "${item.question}"`);
+    const ttft = outcome.firstTokenMs != null ? `, TTFT ${outcome.firstTokenMs}ms` : "";
+    console.log(`[${mark}] (${outcome.elapsedMs}ms${ttft}) ${item.id} — ${item.category} — "${item.question}"`);
     if (outcome.answer) {
       console.log(`       answer: ${outcome.answer.replace(/\s+/g, " ").slice(0, 220)}`);
       console.log(`       citations: ${(outcome.citations ?? []).map((c) => `chunk${c.chunkId}@p${c.page ?? "?"}(${c.score?.toFixed(3)})`).join(", ") || "(none)"}`);

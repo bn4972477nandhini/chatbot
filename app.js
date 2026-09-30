@@ -65,7 +65,18 @@ function parseChatBody(body) {
     options.filter = body.filter;
   }
 
-  return { question: question.trim(), options };
+  // Delivery-mode flag only — never passed into retrieval `options`, so it
+  // cannot affect what's retrieved or how it's ranked, only how the answer
+  // is sent back.
+  let stream = false;
+  if (body.stream !== undefined) {
+    if (typeof body.stream !== "boolean") {
+      throw badRequest("'stream' must be a boolean.");
+    }
+    stream = body.stream;
+  }
+
+  return { question: question.trim(), options, stream };
 }
 
 /**
@@ -190,13 +201,77 @@ function createApp({
 
   app.post("/chat", chatLimiter, async (req, res, next) => {
     try {
-      const { question, options } = parseChatBody(req.body);
+      const { question, options, stream } = parseChatBody(req.body);
 
-      const { answer, citations } = await chatService.ask(question, options, {
-        logger: req.log,
+      if (!stream) {
+        const { answer, citations } = await chatService.ask(question, options, {
+          logger: req.log,
+        });
+
+        res.json({ answer, citations });
+        return;
+      }
+
+      // Server-Sent Events. Citations are sent as soon as retrieval finishes
+      // (they never depend on the model's output), then one `token` event per
+      // generated fragment, then `done` — or `error` in place of `done` if
+      // anything fails after streaming has already started, since headers are
+      // committed by that point and the normal JSON error boundary can no
+      // longer run.
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      // Some reverse proxies buffer proxied responses by default, which would
+      // silently turn this back into one big delayed write; harmless to send
+      // when there is no such proxy in front.
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      const send = (event, data) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // A client that navigates away or cancels mid-stream must not leave the
+      // underlying Ollama call running for a response nobody is listening for
+      // any more — every Ollama call is serialized through one queue, so an
+      // abandoned generation would otherwise sit in front of every later
+      // request too.
+      // res.on("close") — not req.on("close") — is the reliable signal for an
+      // early client disconnect during a streaming response; the request
+      // object's own "close" event does not fire promptly (or at all, in
+      // some Node versions) for this case, confirmed empirically here.
+      const abortController = new AbortController();
+      res.on("close", () => {
+        if (!res.writableEnded) {
+          req.log.info("client disconnected mid-stream; aborting the in-flight model call");
+          abortController.abort();
+        }
       });
 
-      res.json({ answer, citations });
+      try {
+        await chatService.askStream(question, options, {
+          logger: req.log,
+          signal: abortController.signal,
+          onCitations: (citations) => send("citations", { citations }),
+          onDelta: (delta) => send("token", { delta }),
+        });
+        send("done", {});
+      } catch (error) {
+        if (error instanceof AppError && error.expose) {
+          req.log[error.status >= 500 ? "error" : "warn"]("request failed", {
+            status: error.status,
+            code: error.code,
+            ...serialiseError(error),
+          });
+          send("error", { message: error.message });
+        } else {
+          req.log.error("unhandled request error", serialiseError(error));
+          send("error", { message: "Internal server error." });
+        }
+      } finally {
+        res.end();
+      }
     } catch (error) {
       next(error);
     }

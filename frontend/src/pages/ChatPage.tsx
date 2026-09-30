@@ -6,10 +6,18 @@ import { ChatMessage } from "../components/ChatMessage";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { TypingIndicator } from "../components/TypingIndicator";
+import { VoiceControls } from "../components/VoiceControls";
 import { useChat } from "../hooks/useChat";
+import { useVoice } from "../hooks/useVoice";
 
 export function ChatPage() {
   const { messages, isLoading, error, send, retry, clear, dismissError } = useChat();
+  const voice = useVoice({
+    onFinalTranscript: send,
+    isAssistantResponding: isLoading,
+    hasAssistantError: error !== null,
+    messages,
+  });
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Keep the newest message, the typing indicator and any error in view.
@@ -18,6 +26,10 @@ export function ChatPage() {
   }, [messages, isLoading, error]);
 
   const hasMessages = messages.length > 0;
+  // The streaming assistant bubble already shows progress once it exists —
+  // showing the typing dots underneath it too would be redundant. Only show
+  // them during the gap before the first citations/token callback arrives.
+  const isStreamingReply = isLoading && messages[messages.length - 1]?.role === "assistant";
 
   return (
     <div className="flex h-full justify-center bg-slate-100">
@@ -31,7 +43,7 @@ export function ChatPage() {
                 <ChatMessage key={message.id} message={message} />
               ))}
 
-              {isLoading && <TypingIndicator />}
+              {isLoading && !isStreamingReply && <TypingIndicator />}
 
               {error && (
                 <ErrorBanner
@@ -62,6 +74,17 @@ export function ChatPage() {
           <div ref={bottomRef} />
         </main>
 
+        <VoiceControls
+          state={voice.state}
+          support={voice.support}
+          interimTranscript={voice.interimTranscript}
+          voiceError={voice.voiceError}
+          onDismissVoiceError={voice.dismissVoiceError}
+          onStartListening={voice.startListening}
+          onStopListening={voice.stopListening}
+          onStopSpeaking={voice.stopSpeaking}
+          disabled={isLoading}
+        />
         <ChatInput onSend={send} disabled={isLoading} />
       </div>
     </div>

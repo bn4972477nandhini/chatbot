@@ -28,10 +28,18 @@ const { Document } = require("@langchain/core/documents");
 async function rankByBm25(points, keywords, { k } = {}) {
   if (keywords.length === 0 || points.length === 0) return [];
 
+  // The underlying "okapibm25" package matches terms with a case-sensitive
+  // regex, but extractKeywords() always lowercases the question. Source PDF
+  // text routinely capitalizes the very words a question asks about — labels
+  // ("Author:"), headers, proper nouns at a sentence start — so without
+  // lowercasing the document text here, a keyword can silently score zero
+  // against every chunk in the pool even when it appears verbatim, just in a
+  // different case. Only this internal scoring copy is lowercased; the
+  // original points (and their original-case pageContent) are what's returned.
   const docs = points.map(
     (point, index) =>
       new Document({
-        pageContent: point.payload?.pageContent ?? "",
+        pageContent: (point.payload?.pageContent ?? "").toLowerCase(),
         metadata: { index },
       })
   );

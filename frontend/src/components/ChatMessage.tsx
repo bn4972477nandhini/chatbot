@@ -109,5 +109,5 @@ function ChatMessageComponent({ message }: { message: Message }) {
   );
 }
 
-/** Messages are immutable once added: memo stops the whole transcript re-rendering when a new message arrives or the typing indicator toggles. */
+/** memo stops the whole transcript re-rendering on every streamed fragment — only the one message object that actually changed re-renders. */
 export const ChatMessage = memo(ChatMessageComponent);

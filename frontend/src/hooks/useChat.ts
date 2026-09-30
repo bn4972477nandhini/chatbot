@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ChatApiError, GENERIC_ERROR, sendQuestion } from "../services/chatApi";
+import { ChatApiError, GENERIC_ERROR, streamQuestion } from "../services/chatApi";
 import type { Message } from "../types/chat";
 
 function createId(): string {
@@ -36,6 +36,10 @@ export interface UseChatResult {
  * time a request starts or finishes.
  *
  * The backend is single-turn: each request sends one question with no history.
+ * The answer streams in — the assistant message is created empty as soon as
+ * citations arrive (which never depend on generation, so they're available
+ * well before the first token on this CPU-only setup) and grows in place as
+ * each fragment lands, rather than appearing all at once at the end.
  */
 export function useChat(): UseChatResult {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -70,23 +74,51 @@ export function useChat(): UseChatResult {
       setLoading(true);
       setError(null);
 
-      try {
-        const { answer, citations } = await sendQuestion(question, controller.signal);
+      // Created lazily, on the first citations/delta callback, rather than up
+      // front — an empty bubble should never appear before there is anything
+      // (even just citations) to show in it.
+      const assistantId = createId();
+      let assistantMessageStarted = false;
 
+      const ensureAssistantMessage = () => {
+        if (assistantMessageStarted) return;
+        assistantMessageStarted = true;
         setMessages((current) => [
           ...current,
-          {
-            id: createId(),
-            role: "assistant",
-            content: answer,
-            citations,
-            timestamp: Date.now(),
-          },
+          { id: assistantId, role: "assistant", content: "", citations: [], timestamp: Date.now() },
         ]);
+      };
+
+      const updateAssistantMessage = (patch: (message: Extract<Message, { role: "assistant" }>) => Extract<Message, { role: "assistant" }>) => {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistantId && message.role === "assistant" ? patch(message) : message
+          )
+        );
+      };
+
+      try {
+        await streamQuestion(question, controller.signal, {
+          onCitations: (citations) => {
+            ensureAssistantMessage();
+            updateAssistantMessage((message) => ({ ...message, citations }));
+          },
+          onDelta: (delta) => {
+            ensureAssistantMessage();
+            updateAssistantMessage((message) => ({ ...message, content: message.content + delta }));
+          },
+        });
       } catch (caught) {
         // Cancelled by clear() or unmount — not a failure to surface.
         if (controller.signal.aborted) return;
 
+        // The banner keeps its wording short; the full error (HTTP status,
+        // original exception) goes to the console for debugging.
+        if (import.meta.env.DEV) console.error("[chat] request failed:", caught);
+
+        // Whatever streamed in before the failure (if anything) stays visible
+        // — losing an already-partially-correct answer on top of the error
+        // would be worse than showing both.
         if (caught instanceof ChatApiError) {
           setError({ message: caught.message, retryable: caught.retryable });
         } else {

@@ -4,79 +4,62 @@ const SYSTEM_PROMPT = `You are an AI assistant answering ONLY from the Founder B
 
 Rules:
 
-- Answer using the provided context. The answer does not need to appear
-  verbatim in any single chunk, and the context does not need to repeat the
-  question's exact wording — read the passages for their meaning and reason
-  across them, the way a person who had read this book would.
-- If multiple chunks contain relevant information, synthesize and combine them
-  into one coherent answer, even when no single chunk states the full answer
-  on its own — but only when the chunks are complementary pieces of the same
+- Answer using the provided context, reading passages for their meaning
+  rather than requiring the question's exact wording, and reason across
+  chunks the way someone who had read the book would.
+- Synthesize complementary chunks into one answer, even when no single chunk
+  states the full answer on its own — but only when the chunks are complementary pieces of the same
   answer. When chunks instead offer distinct, competing explanations for the
   same question, follow the rule below on choosing between them rather than
-  blending them into one story.
-- Never state a specific fact, number, name, or claim that the context does
-  not support. Reasoning about and summarizing what the context describes is
-  expected; inventing details it does not describe is not.
-- When the context quotes or names more than one person, attribute each
-  statement or description to whoever actually said it or whom it actually
-  describes — never to the question's main subject by default just because
-  the text appears nearby.
+  blending them.
+- Never state a specific fact, number, name, or claim the context does not
+  support — summarizing what it describes is fine, inventing details is not.
+- Attribute each statement to whoever actually said or was described as
+  doing it — never to the question's subject by default just because the
+  text is nearby.
+- Two attribution patterns are easy to misread: a passage written in the first person ("I am X, a Y") states Y about the
+  speaker X, not whoever else is nearby; and a name immediately followed by a short title or credential line
+  (a byline or signature) attaches those credentials to that named person, even when a different person is
+  mentioned more often nearby or is who the question asks about.
 - When the context gives both a short form (a nickname, an abbreviation) and
   a more complete form (a full name, an exact figure) for the same fact,
   answer with the complete form.
-- A rhetorical or hypothetical question inside the context (e.g. "what would
-  you do in scenario X?") is not itself a case study, and a result or figure
-  stated near it may belong to a different, already-finished case study the
-  context described just before it. Only state a figure as the answer to the
-  user's question if the context actually ties that figure to that specific
-  subject — never because the two happen to sit next to each other.
-- When the user asks for a specific number and the context does not tie any
-  number to that exact subject, do not hedge with a qualitative stand-in
-  ("a small amount", "very little", "not much") either — that still implies
-  a figure the context never gave. Treat it the same as having no answer.
-  This applies to every kind of figure — money spent, reach, ROI, counts,
-  dates — not only monetary amounts. Before citing any such figure, confirm
-  the passage that states it is actually about the specific subject named in
-  the question; a passage about a different campaign, person, or event is
-  not evidence for the one asked about, even if it was retrieved alongside
-  the question or uses the same kind of metric.
-- When the context directly and explicitly states a concrete fact, name, or
-  reason that answers the question, give that directly. Do not pass over an
-  explicit, on-point statement in favor of a more general or thematic passage
-  elsewhere in the context that merely discusses related ideas.
-- A parenthetical inside a source that starts "(From: ...)" is context the
-  indexing process attached to confirm what that source's figures or facts
-  are actually about — it is not a separate, unconnected passage, and it is
-  exactly the kind of explicit confirmation the number-attribution rule above
-  asks for. When a source contains one, treat the subject it names as
+- A rhetorical or hypothetical question inside the context is not itself a case study, and a result or figure stated near it may belong to a different, already-finished case study. Only state a figure if the
+  context actually ties it to that specific subject.
+- When the context does not tie a number to that exact subject, do not hedge with a qualitative stand-in
+  ("a small amount", "very little") either — treat it the same as having no answer. Applies to any figure — money spent, reach, ROI, counts,
+  dates. Confirm the passage stating it is actually about the specific subject asked before citing it — a passage about a different campaign, person, or event is
+  not evidence for the one asked about.
+- When the context directly and explicitly states a concrete fact, name, or reason that answers the question, give that directly rather than a more general or thematic passage elsewhere.
+- A parenthetical inside a source that starts "(From: ...)" confirms what that source's figures are actually about. When a source contains one, treat the subject it names as
   confirmed for the figures in that same source, and cite the figure
-  directly rather than treating it as unconfirmed or belonging elsewhere.
+  directly.
 - If one passage names who or what specifically caused an event, and a
   different passage only states a general goal or theme related to it, answer
-  with the specific cause, not the general goal — even if the general one is
-  phrased as if it directly answers the question. Do not combine the two into
-  one explanation unless the context itself ties them together; being
-  retrieved together is not the context tying them together.
+  with the specific cause, not the general goal. Do not combine the two into
+  one explanation unless the context itself ties them together — being
+  retrieved together isn't that.
 - If more than one passage offers a plausible but different, unconnected
-  answer to the same question, and nothing in the context indicates which one
-  the question is actually asking about, say plainly that the context offers
-  more than one possible answer and briefly state what each says, rather than
-  silently picking one or merging them into a single account.
-- Decide once, before you start writing: does the context contain information
-  relevant to the question, or not?
-  - If yes: write the synthesized answer and stop there. Do not follow it with
-    a remark that the information could not be found — you just found it.
-  - If no, because the context has nothing topically related to the question
-    (not merely because no chunk uses its exact words): reply with ONLY the
-    fallback sentence below, nothing else.
-  - Never mix the two — a real answer and the fallback sentence do not appear
-    in the same reply.
+  answer to the same question, with nothing indicating which one is meant, say plainly that the context offers
+  more than one possible answer and briefly state each, rather than
+  silently picking one.
+- Decide once, before writing: does the context contain relevant information?
+  If yes, write the answer and stop there — don't follow it with a remark
+  that the information could not be found. If no, because the context has
+  nothing topically related to the question (not merely different wording),
+  reply with ONLY the fallback sentence below, nothing else. Never mix a
+  real answer and the fallback sentence in the same reply.
 
 Fallback sentence, verbatim, for when the context has nothing relevant:
 
 'I couldn't find that information in the Founder Book.'
 
 - Keep answers clear and concise.
+- Write the answer the way someone who had read the book would say it. The
+  excerpt labels and the word "context" are internal to this prompt and
+  mean nothing to the reader, so never mention them — no "According to
+  Source 2", no "According to the context", no "the excerpt says". If a page
+  number helps, write it as "(page 8)".
 
 Context handling:
 
@@ -149,9 +132,26 @@ function sanitiseText(value) {
 }
 
 /**
- * Renders retrieved chunks into the context block. Each chunk is numbered so the
- * model can refer to sources positionally, and labelled with its chunk id so the
- * citation list stays traceable back to Qdrant.
+ * Renders retrieved chunks into the context block, best evidence first. The
+ * label carries only the page (when known) — no position number, internal
+ * chunkId or document name. A small local model reliably echoes whatever the
+ * label says into its answer despite the system prompt forbidding it
+ * ("According to Source 2, …"); a page-only label turns that echo into
+ * "(page 8)", which is meaningful to a reader, instead of an internal number
+ * that isn't.
+ *
+ * Neither of those two is used for anything the model needs: chunkId is a
+ * raw Qdrant point ID with no semantic meaning to a reader, and the returned
+ * `citations` array (chatService.js) is built directly from the retrieved
+ * chunk objects — never parsed from this label or the model's answer text —
+ * so dropping both from what the model sees costs nothing functionally.
+ * `document` was additionally always the same single-book value on every
+ * chunk, every request, in this app. Real, measured side benefit beyond the
+ * ~10-11 fewer tokens per chunk: the model had a visible habit of echoing
+ * this exact label ("According to Source 2 | chunkId: 8 | ... | document:
+ * Founder.pdf, ...") into its answer prose, at the cost of output tokens
+ * that add nothing the citations array doesn't already carry — the shorter
+ * label shortens that echo too, when it still happens.
  */
 function formatContext(chunks) {
   if (!chunks || chunks.length === 0) return "(no relevant context found)";
@@ -160,13 +160,13 @@ function formatContext(chunks) {
 
   for (let index = 0; index < chunks.length; index++) {
     const chunk = chunks[index];
-    const pageLabel =
+    const label =
       chunk.page == null
-        ? ""
-        : ` | page: ${chunk.pageEnd != null && chunk.pageEnd !== chunk.page ? `${chunk.page}-${chunk.pageEnd}` : chunk.page}`;
-    parts[index] =
-      `[Source ${index + 1} | chunkId: ${chunk.chunkId}${pageLabel} | document: ${sanitiseText(chunk.source)}]\n` +
-      sanitiseText(chunk.pageContent);
+        ? "[Excerpt]"
+        : chunk.pageEnd != null && chunk.pageEnd !== chunk.page
+          ? `[Excerpt from pages ${chunk.page}-${chunk.pageEnd}]`
+          : `[Excerpt from page ${chunk.page}]`;
+    parts[index] = `${label}\n` + sanitiseText(chunk.pageContent);
   }
 
   return parts.join("\n\n---\n\n");

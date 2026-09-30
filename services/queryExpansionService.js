@@ -30,7 +30,11 @@ const SYSTEM_PROMPT =
  * for another (e.g. "who is the author?"), without hand-listing synonyms for
  * any particular topic.
  */
-function createQueryExpansionService({ getClient = defaultGetClient, logger = defaultLogger } = {}) {
+function createQueryExpansionService({
+  getClient = defaultGetClient,
+  logger = defaultLogger,
+  timeoutMs = config.llm.timeoutMs,
+} = {}) {
   /**
    * @param {string} question
    * @returns {Promise<string[]>} up to MAX_VARIANTS alternative phrasings;
@@ -41,14 +45,30 @@ function createQueryExpansionService({ getClient = defaultGetClient, logger = de
   async function expandQuery(question) {
     try {
       const client = getClient();
-      const response = await client.chat.completions.create({
-        model: config.llm.chatModel,
-        max_tokens: MAX_OUTPUT_TOKENS,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: question },
-        ],
-      });
+      // Deliberately NOT seeded, even when CHAT_SEED is set for the main
+      // answer call: a fixed seed here would make the generated paraphrases
+      // deterministic-but-fixed, which changes which chunks retrieval's RRF
+      // fusion pulls in — a retrieval-shaping side effect of a knob meant
+      // only to stabilise the final answer's wording. Confirmed by measurement
+      // (see the retrieval-side regression this caused on a real run) rather
+      // than assumed.
+      const response = await client.chat.completions.create(
+        {
+          model: config.llm.chatModel,
+          max_tokens: MAX_OUTPUT_TOKENS,
+          ...(config.llm.keepAlive ? { keep_alive: config.llm.keepAlive } : {}),
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: question },
+          ],
+        },
+        // Hard, explicit deadline independent of the client's own configured
+        // timeout — a paraphrase is a recall aid, not a hard dependency, so a
+        // hung expansion call must never be able to hold up the rest of the
+        // request (or, serialized behind it, every later request) for longer
+        // than this.
+        { signal: AbortSignal.timeout(timeoutMs) }
+      );
 
       const content = response?.choices?.[0]?.message?.content ?? "";
       const normalizedQuestion = question.trim().toLowerCase();
