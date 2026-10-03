@@ -61,18 +61,41 @@ node scripts/evaluate-chat.js       # end-to-end grading over real HTTP against 
 indexed; re-run `tune-threshold.js` after any re-chunk or embedding-model change rather than
 guessing a new `RETRIEVAL_SCORE_THRESHOLD`.
 
+Only those four `.js` files in `scripts/` are tracked. The many `eval-*`, `cap*-test*` and
+`bench-*` `.json`/`.log` files beside them are untracked output from past evaluation runs, not
+inputs or fixtures.
+
 ## Architecture
 
-Single-turn RAG over one book (`uploads/founder.pdf`). No conversation memory and no auth: `/chat`
-sends one question and nothing carries between requests (apart from a short-lived response cache —
-see `chatService.js`).
+RAG over one book (`uploads/founder.pdf`). No auth and no server-side session: `/chat` sends one
+question plus an optional client-held `history` (last ≤4 turns; the frontend sends its last two
+exchanges). The server uses that history only when the question is detected as a follow-up
+(`followUpService.js`); otherwise each request is independent (apart from a short-lived response
+cache — see `chatService.js`).
+
+**Latency budget (CPU-only Ollama, llama3.2 3B, measured from Ollama's `server.log`):** the model
+reads the prompt at ~23 tokens/s and writes at ~3 tokens/s. Retrieval is ~0.3 s. Time to the first
+token is almost all prompt reading: the system prompt (~1,026 tokens) is normally served from Ollama's
+prefix cache, so each request pays for the ~1,000 tokens of retrieved passages (~45 s). Each extra
+passage costs ~10 s and every history turn in the prompt costs its tokens too. Weigh any prompt
+addition against that, and keep per-request text out of the system prompt so the prefix cache holds.
 
 `/chat` has two response modes. The default is one JSON body `{ answer, citations }`. With
 `"stream": true` it answers as Server-Sent Events: `citations` (sent as soon as retrieval finishes),
 then one `token` event per model fragment, then `done` — or `error` in place of `done`, because
 once SSE headers are committed the JSON error boundary can no longer run, so the route applies the
 same `AppError.expose` rule itself. A client disconnect (`res.on("close")`, not `req`) aborts the
-in-flight model call. The frontend always uses the streaming mode (`chatApi.streamQuestion`).
+in-flight model call and is logged at info level as a cancellation, not as a 502. When the model's
+whole reply is the "not found" sentence, a second `citations` event with `[]` follows, so no source
+badges show under a non-answer. When `answerGuard` changed already-streamed text, an `answer`
+event carries the full corrected answer before `done`, and the client replaces what it showed.
+The frontend always uses the streaming mode (`chatApi.streamQuestion`).
+
+Debug tracing: run with `LOG_LEVEL=debug` to get `[CHAT] question` (language, intent, follow-up,
+the retrieval query actually used), `[RETRIEVAL] results` (every candidate's chunkId, page, score
+and text preview, plus which were selected or dropped), `[CONTEXT] prompt built` and `[ANSWER]
+final` (raw model output, final answer, which guard fired). Together they show whether a wrong
+answer came from query understanding, retrieval, context or generation.
 
 `server.js` is bootstrap only — listen, log startup, graceful shutdown. `app.js` owns the Express
 app: middleware, routes, and a single error boundary. Routes validate, call a service, shape a
@@ -97,16 +120,35 @@ uploads/founder.pdf
 ```
 question
   → conversationalIntentService   exact-match small talk ("hi", "thanks", "bye") → canned reply, stop
-  → response cache                LRU (100) + 10-min TTL keyed on question + options → stop on hit
+  → languageService   english / tanglish / tamil; a non-English question is turned into English
+                      search words (glossary + dropping question words: "IIT fest campaign ku evlo
+                      selavu aachu?" → "IIT fest campaign how much spent cost"), then embedded as
+                      "What does the book say about: <words>"; if none of those words' stems
+                      appear in what was retrieved, it declines without a model call
+  → followUpService   follow-up? → retrieval query gets the earlier topic question(s) prepended,
+                      prompt gets the last exchange; otherwise no history at all
+  → intentService     author_identity / author_background? → that intent's own retrieval query
+                      replaces the question's, no query expansion, topK+3 candidates; for
+                      author_identity only chunks mentioning authorship are kept ("Author: X"
+                      lines first), and none kept → decline without a model call
+  → response cache                LRU (100) + 10-min TTL keyed on question + options (+ history
+                                  when it was used) → stop on hit
   → retrievalService  embed → Qdrant query (pool = topK×4 when MMR) → MMR re-rank to topK
                       (topK+2 for whole-book "summarize / main idea" questions — isAbstractQuestion)
-  → promptService     system prompt + sanitised context block + question
-  → chatService       chat completion (CHAT_TEMPERATURE, default 0.2), buffered or streamed
+  → promptService     system prompt + [history] + sanitised context block + question
+                      + intent answer shape, or language line (non-English / explicit only)
+  → chatService       chat completion (CHAT_TEMPERATURE, default 0.2), buffered or streamed;
+                      intents cap max_tokens (40 / 120)
+  → answerGuard       loop → stop the stream, trim; a ≥3-digit or decimal figure absent from the
+                      context → whole answer replaced by the "not found" reply; streamed text that
+                      changed is re-sent whole as an SSE `answer` event
   → { answer, citations: [{ chunkId, score, page, pageEnd }] }
 ```
 
-`ask()` and `askStream()` share one `prepareRequest()` (small talk → cache → retrieval → prompt), so
-the two paths can't drift apart. Only how the model gets called differs between them.
+`ask()` and `askStream()` share one `prepareRequest()` (small talk → language/follow-up → cache →
+retrieval → prompt), so the two paths can't drift apart. Only how the model gets called differs
+between them. An English, non-follow-up question keeps the pre-existing shape: the same
+retrieval query and the same two-message prompt.
 
 ### Configuration
 
@@ -214,6 +256,7 @@ execute for real without network access. Keep new services in this shape.
 - **`qdrantService.js`** — Cosine. Search uses **`client.query()`** — `client.search()` does not
   exist in `@qdrant/js-client-rest` 1.19 — and results come back under `points`. Upserts in batches
   of 256 with `wait: true`. A 404 on search is translated to a "run POST /index-book first" 503.
+  A search that fails with no HTTP status (dropped connection) is retried once after 200 ms.
   `ensureCollection` verifies an existing collection's vector size, so a mismatch fails clearly.
   Payload indexes are created on `source` (keyword), `chunkId` and `page` (integer).
 - **`mmr.js`** — pure vector maths, no Qdrant or OpenAI coupling, unit-tested directly. With 200
@@ -234,7 +277,11 @@ execute for real without network access. Keep new services in this shape.
   hit isn't already lexically confirmed, up to two LLM-generated paraphrases of the question
   (`queryExpansionService.js`) searched the same way — skipped whenever lexical and dense already agree
   on the same top chunk, since there's nothing left for a paraphrase to rescue and the extra chat +
-  embedding round trip is the most expensive part of the pipeline on local Ollama. Independently of
+  embedding round trip is the most expensive part of the pipeline on local Ollama. Paraphrase searches
+  are unfiltered (`scoreThreshold: 0`) only when the original question has evidence of its own (a
+  dense hit or a keyword hit — `hasOriginalEvidence`); with no evidence they use the normal threshold,
+  otherwise an off-topic question would always pull the book's nearest pages and spend a full model
+  call (~40 s on local Ollama) before declining. Independently of
   fusion, a capped number of lexical/paraphrase-corroborated chunks and one same-section runner-up are
   carried through **untouched by MMR** (`guaranteedCorroborated` / `guaranteedSection`) before MMR
   re-ranks the rest to fill the remaining `topK` slots — plain RRF fusion alone still let MMR's
@@ -285,11 +332,60 @@ execute for real without network access. Keep new services in this shape.
   metadata exists. The prompt also tells the model to attribute quotes/descriptions to whichever
   person they actually concern rather than defaulting to the question's subject, and to prefer a
   fact's complete form (full name, exact figure) over a short form when the context gives both.
+  Don't shorten `SYSTEM_PROMPT` for speed. A version cut to ~45% of its length failed 5 of the
+  first 20 eval questions against baseline's 2 ("main message" → "Sakthi.", the Rs.6000 figure
+  missed). It saves time only on a prefix-cache miss, since the prompt is normally cached. Per-request
+  instructions (`LANGUAGE_INSTRUCTIONS`, `FOLLOW_UP_INSTRUCTION`) go after the question, never
+  into `SYSTEM_PROMPT`, so the cached prefix stays byte-identical and an English question gets
+  exactly the baseline system prompt. `NO_ANSWER_REPLIES` holds the fallback per language and
+  `isNoAnswerReply` recognises any of them. `formatContext` drops the ~200-char opening of a chunk
+  that repeats the end of its predecessor (`chunkId - 1`) when both are in the context. The overlap
+  is an exact substring, so nothing is lost.
+- **`languageService.js`** — `detectLanguage` (explicit "in English"/"Tanglish la"/"in Tamil"
+  first, then Tamil script, then a Tanglish word list: one strong word or two weak ones) and
+  `toRetrievalQuery` (removes language requests, Tanglish words and "explain"-type words, and swaps
+  Tamil content words for English via `TRANSLATIONS`). No model call: the embedding model
+  (nomic-embed-text) is English-only, and llama3.2 3B translated 5 of 10 test questions wrongly.
+  Extend `TRANSLATIONS` (plain dictionary meanings only) when a Tanglish question retrieves badly.
+  `asSearchQuestion` adds the "What does the book say about:" frame: bare word lists embedded
+  ~0.15 lower than the same words as a question. The frame alone looks like the book's intro pages,
+  which is why `chatService` also requires a stem match (an off-topic "Pizza dough epdi pannanum?"
+  scored 0.53 on the frame). English questions are never rewritten.
+- **`intentService.js`** — word-list detection (English + Tanglish), no model call, no book facts.
+  `author_identity`: an author term ("author", "writer", "ezhuthunadhu"…) plus a who/name term and
+  nothing else of substance, so "Who wrote the foreword?" and "What did the author say about X?"
+  don't match. Before it existed, "intha book writer yaru" was searched as "book writer". That put
+  the acknowledgements page (an editor credited as "Author & Content Writer") first and marketing
+  and farmer passages in the rest of the context, and the 3B model looped ("ayan irukkenga…").
+  `author_background`: a work/profession/company term with an author term, or a person pronoun
+  ("avaru", "his") right after an author question. Its query is phrased like an "about the author"
+  page, because that page says "He is the Founder…" without the name. Tanglish answers for both
+  intents use a fill-in form ("Indha book-oda writer <name>.", "Avaru <role> at <company>."):
+  free-form Tanglish from llama3.2 3B invented content in every variant tried. New intents go here,
+  with a query, an optional evidence regex and per-language answer instructions.
+- **`answerGuard.js`** — `trimRepetition`: a 5-word phrase seen 3 times, or (non-English only) an
+  all-lowercase word pair seen 4 times, ends the answer at the loop's second occurrence. Names and
+  labels such as "Zero Rupee Marketing" or "SPENT: Rs." don't count. `ungroundedNumbers`: figures
+  with ≥3 digits or a decimal that the chunks, page labels and question never state; one is enough
+  to replace the answer with the "not found" reply. `stripQuestionEcho`: drops a word-for-word
+  repeat of the question at the start of the answer, which the 3B model did in most Tanglish answers.
+- **Cut-off streams** — `createCompletionStream` throws if the stream ends without a
+  `finish_reason`, unless the loop guard stopped it or the client left. Seen live: the laptop slept
+  mid-answer, and on wake the half sentence was returned as a complete answer.
+- **`followUpService.js`** — a question is a follow-up when nothing searchable is left, or it has a
+  back-reference ("it", "his", "adhu"…, after removing "this book"-style phrases) and ≤2 keywords
+  of its own. Its retrieval query is the earlier topic question(s) plus itself. The chain walks back
+  through earlier follow-ups to the question that named the topic. Only the last exchange goes into
+  the prompt, with the answer cut to 600 chars.
 - **`chatService.js`** — short-circuits to `NO_ANSWER_REPLY` with empty citations when retrieval
   returns nothing, rather than spending a model call on empty context. Sends `max_tokens:
   CHAT_MAX_OUTPUT_TOKENS` (both the normal call and the temperature-fallback retry) to bound
   worst-case generation time — most load-bearing on CPU-only local Ollama inference, where output
-  length dominates latency. Citations include `page`/`pageEnd` alongside `chunkId`/`score`. The
+  length dominates latency. Citations include `page`/`pageEnd` alongside `chunkId`/`score`, and are
+  emptied when the reply is only a fallback sentence. The "chat request complete" log line carries
+  `language`, `followUp`, `retrievalMs`, `gptMs`, `firstTokenMs` (model call → first token, i.e.
+  prefill), `timeToFirstTokenMs` (request → first token) and `totalMs`. The first-token clock starts
+  *before* `create()`, because Ollama only answers the HTTP request once the first token exists. The
   response cache is invalidated only by its TTL: the service has no dependency on the indexer, so
   after a `/index-book` re-index, repeated questions can return stale answers for up to 10 minutes.
 - **`indexService.js`** — a module-level in-flight guard rejects a concurrent `/index-book` with
@@ -365,7 +461,10 @@ unreachable", since every Express error is JSON.
 `useChat` returns callbacks with **empty dependency lists** that read mutable state through refs, so
 their identities stay stable and memoised children don't re-render on every request. Preserve that
 when adding to the hook. A caller-initiated abort (`clear()`, unmount) is deliberately not surfaced
-as an error.
+as an error. Each request carries the last two completed exchanges as `history` (read through
+`messagesRef`). Retry resends the same history. The assistant bubble is created on the first
+**token**, not on the `citations` event: citations arrive ~45 s earlier on CPU Ollama and are held
+until then, so the typing indicator stays up instead of an empty bubble that looks stuck.
 
 `chatApi.ts` duplicates `MAX_QUESTION_LENGTH = 1000` to catch over-long input before a round trip —
 it mirrors the server's `MAX_QUESTION_LENGTH` and must be updated alongside it. A 400 is marked

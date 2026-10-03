@@ -32,7 +32,7 @@ describe("warmUp (ollama provider)", () => {
     });
 
     await service.warmUp();
-    await service.ask("Who wrote this book?");
+    await service.ask("What is Zero Rupee Marketing?");
 
     const [warm, real] = openai.calls.chat;
     const sharedUserPrefix = `Context:\n\n${CONTEXT_START}\n`;

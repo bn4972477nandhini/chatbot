@@ -310,6 +310,24 @@ Optional tuning fields — omit them and the configured defaults apply:
 | `topK` | integer 1–20 | Override chunks retrieved |
 | `scoreThreshold` | number 0–1 | Override the minimum score |
 | `filter` | object | Qdrant payload filter, e.g. `{"must":[{"key":"source","match":{"value":"Founder.pdf"}}]}` |
+| `stream` | boolean | Answer as Server-Sent Events (`citations`, `token`…, `done`) instead of one JSON body |
+| `history` | array, max 4 | Earlier turns `{ "role": "user" \| "assistant", "content": "…" }` (≤ 2000 chars each), oldest first, so a follow-up like "Why is it useful?" can be resolved. Used only when the question is detected as a follow-up |
+
+**Streaming events.** `citations`, then `token`…, then `done` (or `error`). Two extra events
+can appear: a second `citations` with `[]` when the reply turned out to be "not found", and
+`answer` (`{ "answer": "…" }`) when a check corrected text already streamed (a repetition loop cut,
+or an unsupported figure). The client then shows that text instead.
+
+**Author questions.** "Who wrote this book?" and its Tanglish forms ("intha book writer yaru",
+"author name enna?") are answered only from passages that mention authorship. Questions about
+the author's work, including "Avaru enna work pannirukkaru?" right after one, are searched as an
+"about the author" query. See `services/intentService.js`. Set `LOG_LEVEL=debug` to see each
+request's retrieval query, scored candidates, selected chunks and raw answer.
+
+**Language.** Questions written in Tanglish ("Consistency na enna?") or asking for it ("Tanglish
+la explain pannu") are answered in Tanglish; "in Tamil" or Tamil script gets Tamil; everything else
+gets English. Detection is a word list in `services/languageService.js`, with no model call. The "not
+found" reply is localised the same way.
 
 Errors return `{ "success": false, "error": "…" }` with status `400` (validation), `429`
 (rate limited), `502` (upstream) or `500`. Stack traces are never returned.

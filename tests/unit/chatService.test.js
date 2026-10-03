@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
 
 const { createChatService } = require("../../services/chatService");
-const { NO_ANSWER_REPLY, CONTEXT_START } = require("../../services/promptService");
+const { NO_ANSWER_REPLY, NO_ANSWER_REPLIES, CONTEXT_START } = require("../../services/promptService");
 const { createMockOpenAI, createTestLogger } = require("../helpers/mocks");
 
 const chunk = (chunkId, score, page = chunkId) => ({
@@ -30,7 +30,7 @@ function build({ chunks = [chunk(12, 0.92)], client } = {}) {
 }
 
 /** A fake client whose chat.completions.create returns an async-iterable stream of chunks, mirroring the openai SDK's streaming shape. */
-function createStreamingMockClient({ chunks = ["A mock", " answer."], usage } = {}) {
+function createStreamingMockClient({ chunks = ["A mock", " answer."], usage, finished = true } = {}) {
   const calls = [];
   return {
     calls,
@@ -43,6 +43,9 @@ function createStreamingMockClient({ chunks = ["A mock", " answer."], usage } = 
               for (const text of chunks) {
                 yield { choices: [{ delta: { content: text } }] };
               }
+              // A real stream's last chunk carries finish_reason; `finished:
+              // false` simulates a connection that dropped mid-answer.
+              if (finished) yield { choices: [{ delta: {}, finish_reason: "stop" }] };
               if (usage) yield { choices: [{ delta: {} }], usage };
             },
           };
@@ -138,7 +141,7 @@ describe("wider-evidence routing for abstract/summary questions", () => {
 
   it("does not widen the limit for an ordinary single-fact question", async () => {
     const { service, seenOptions } = buildWithLimitCapture();
-    await service.ask("Who is the author of this book?");
+    await service.ask("Where is the author based?");
     assert.equal(seenOptions[0].limit, undefined);
   });
 
@@ -556,7 +559,7 @@ describe("warmUp", () => {
     const { service, openai } = build();
 
     await service.warmUp();
-    await service.ask("Who wrote this book?");
+    await service.ask("What is Zero Rupee Marketing?");
 
     const [warm, real] = openai.calls.chat;
     const contextPrefix = `Context:\n\n${CONTEXT_START}\n`;
@@ -576,5 +579,374 @@ describe("warmUp", () => {
     const { service } = build({ client: openai });
 
     await assert.rejects(service.warmUp(), /ECONNREFUSED/);
+  });
+});
+
+describe("language handling", () => {
+  function buildRecording({ chunks = [chunk(12, 0.92)], client } = {}) {
+    const openai = client ?? createMockOpenAI({ answer: "A mock answer." });
+    const retrieved = [];
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async (question) => {
+          retrieved.push(question);
+          return { chunks, timings: { embedMs: 1, searchMs: 2 } };
+        },
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+    return { service, openai, retrieved };
+  }
+
+  it("retrieves an English question exactly as asked", async () => {
+    const { service, retrieved } = buildRecording();
+
+    await service.ask("Explain the balloon campaign");
+
+    assert.deepEqual(retrieved, ["Explain the balloon campaign"]);
+  });
+
+  it("retrieves a Tanglish question by its subject and asks for a Tanglish answer", async () => {
+    const { service, openai, retrieved } = buildRecording({
+      chunks: [{ ...chunk(12, 0.92), pageContent: "Consistency is about showing up daily." }],
+    });
+
+    await service.ask("Consistency na enna?");
+
+    assert.deepEqual(retrieved, ["What does the book say about: Consistency"]);
+    const userContent = openai.calls.chat[0].messages.at(-1).content;
+    assert.ok(userContent.includes("User Question:\n\nConsistency na enna?"));
+    assert.match(userContent, /Answer language: casual Tanglish/);
+  });
+
+  it("answers the no-context fallback in Tanglish for a Tanglish question", async () => {
+    const { service } = buildRecording({ chunks: [] });
+
+    const result = await service.ask("Pizza dough epdi pannanum?");
+
+    assert.equal(result.answer, NO_ANSWER_REPLIES.tanglish);
+    assert.deepEqual(result.citations, []);
+  });
+});
+
+describe("follow-up questions", () => {
+  const history = [
+    { role: "user", content: "What is Zero Rupee Marketing?" },
+    { role: "assistant", content: "It is guerrilla marketing on almost no budget." },
+  ];
+
+  it("searches with the previous question and puts the last exchange before the question", async () => {
+    const retrieved = [];
+    const openai = createMockOpenAI();
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async (question) => {
+          retrieved.push(question);
+          return { chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } };
+        },
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+
+    await service.ask("Why is it useful?", {}, { history });
+
+    assert.deepEqual(retrieved, ["What is Zero Rupee Marketing? Why is it useful?"]);
+    const roles = openai.calls.chat[0].messages.map((message) => message.role);
+    assert.deepEqual(roles, ["system", "user", "assistant", "user"]);
+  });
+
+  it("sends no history with a standalone question, so the prompt stays as short as before", async () => {
+    const { service, openai } = build();
+
+    await service.ask("Who wrote the foreword?", {}, { history });
+
+    assert.equal(openai.calls.chat[0].messages.length, 2);
+  });
+
+  it("does not serve a standalone answer from cache for the same words asked as a follow-up", async () => {
+    const { service, openai } = build();
+
+    await service.ask("Why is it useful?");
+    await service.ask("Why is it useful?", {}, { history });
+
+    assert.equal(openai.calls.chat.length, 2);
+  });
+});
+
+describe("declined answers", () => {
+  it("drops citations when the model's whole reply is the fallback sentence", async () => {
+    const { service } = build({ client: createMockOpenAI({ answer: NO_ANSWER_REPLY }) });
+
+    const result = await service.ask("What was spent on the salon campaign?");
+
+    assert.equal(result.answer, NO_ANSWER_REPLY);
+    assert.deepEqual(result.citations, []);
+  });
+
+  it("keeps citations on a real answer that merely mentions the book", async () => {
+    const { service } = build({
+      chunks: [{ ...chunk(12, 0.92), pageContent: "The spend was Rs.6000." }],
+      client: createMockOpenAI({ answer: "The Founder Book says the spend was Rs.6000." }),
+    });
+
+    const result = await service.ask("q");
+
+    assert.equal(result.citations.length, 1);
+  });
+
+  it("askStream clears the already-sent citations once the reply turns out to be the fallback", async () => {
+    const client = createStreamingMockClient({ chunks: [NO_ANSWER_REPLY] });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+      },
+      getClient: () => client,
+      logger: createTestLogger(),
+    });
+
+    const citationEvents = [];
+    const result = await service.askStream("q", {}, { onCitations: (c) => citationEvents.push(c) });
+
+    assert.equal(citationEvents.length, 2);
+    assert.equal(citationEvents[0].length, 1);
+    assert.deepEqual(citationEvents[1], []);
+    assert.deepEqual(result.citations, []);
+  });
+});
+
+describe("askStream timing and cancellation", () => {
+  it("measures time to first token from when the model call starts, including prefill", async () => {
+    const client = createStreamingMockClient({ chunks: ["answer"] });
+    const originalCreate = client.chat.completions.create;
+    client.chat.completions.create = async (params) => {
+      // Ollama answers the HTTP request only once the first token exists.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return originalCreate(params);
+    };
+    const logger = createTestLogger();
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+      },
+      getClient: () => client,
+      logger,
+    });
+
+    await service.askStream("q");
+
+    const complete = logger.lines.find((line) => line.msg === "chat request complete");
+    assert.ok(complete.fields.firstTokenMs >= 25, `firstTokenMs was ${complete.fields.firstTokenMs}`);
+    assert.ok(complete.fields.timeToFirstTokenMs >= complete.fields.firstTokenMs);
+    assert.equal(complete.fields.retrievalMs, 3);
+  });
+
+  it("rethrows the abort itself, not a 502, when the client disconnects", async () => {
+    const controller = new AbortController();
+    const client = {
+      chat: {
+        completions: {
+          create: async (params, { signal }) => {
+            controller.abort();
+            throw signal.reason ?? new Error("aborted");
+          },
+        },
+      },
+    };
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+      },
+      getClient: () => client,
+      logger: createTestLogger(),
+    });
+
+    await assert.rejects(
+      () => service.askStream("q", {}, { signal: controller.signal }),
+      (error) => error?.status !== 502
+    );
+  });
+});
+
+describe("repetition penalty", () => {
+  it("is sent for a Tanglish answer and never for an English one", async () => {
+    const { service, openai } = build({
+      chunks: [{ ...chunk(12, 0.92), pageContent: "Zero Rupee Marketing means marketing on no budget." }],
+    });
+
+    await service.ask("What is Zero Rupee Marketing?");
+    await service.ask("Zero Rupee Marketing na enna?");
+
+    assert.equal(openai.calls.chat[0].frequency_penalty, undefined);
+    assert.equal(openai.calls.chat[1].frequency_penalty, 0.6);
+  });
+});
+
+describe("author-identity questions", () => {
+  const authorChunk = { ...chunk(0, 0.49), pageContent: "© John Doe Author: John Doe First Edition" };
+  const editorChunk = { ...chunk(1, 0.62), pageContent: "Thanks Jane Roe, Editor, Author & Content Writer." };
+  const unrelated = { ...chunk(6, 0.52), pageContent: "An Outlier Marketer convinces a small segment." };
+
+  function buildIntent(chunks) {
+    const retrieved = [];
+    const openai = createMockOpenAI({ answer: "Indha book-oda writer John Doe." });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async (query, options) => {
+          retrieved.push({ query, options });
+          return { chunks, timings: { embedMs: 1, searchMs: 2 } };
+        },
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+    return { service, openai, retrieved };
+  }
+
+  it("searches with the intent's query and sends only passages about authorship, explicit line first", async () => {
+    const { service, openai, retrieved } = buildIntent([editorChunk, unrelated, authorChunk]);
+
+    const result = await service.ask("intha book writer yaru");
+
+    assert.equal(retrieved[0].query, "Who is the author of this book? Who wrote this book?");
+    assert.deepEqual(result.citations.map((c) => c.chunkId), [0, 1]);
+    const context = openai.calls.chat[0].messages.at(-1).content;
+    assert.ok(!context.includes("Outlier Marketer"), "the unrelated passage is not in the prompt");
+  });
+
+  it("declines without calling the model when no passage mentions authorship", async () => {
+    const { service, openai } = buildIntent([unrelated]);
+
+    const result = await service.ask("intha book writer yaru");
+
+    assert.equal(result.answer, NO_ANSWER_REPLIES.tanglish);
+    assert.deepEqual(result.citations, []);
+    assert.equal(openai.calls.chat.length, 0);
+  });
+});
+
+describe("answer checks", () => {
+  it("replaces an answer that states a figure the context never gives", async () => {
+    const { service } = build({ client: createMockOpenAI({ answer: "The campaign cost Rs.9999." }) });
+
+    const result = await service.ask("How much did the campaign cost?");
+
+    assert.equal(result.answer, NO_ANSWER_REPLY);
+    assert.deepEqual(result.citations, []);
+  });
+
+  it("keeps an answer whose figures are all in the context", async () => {
+    const { service } = build({
+      chunks: [{ ...chunk(3, 0.9), pageContent: "The campaign cost Rs.6,000." }],
+      client: createMockOpenAI({ answer: "The campaign cost Rs.6000." }),
+    });
+
+    const result = await service.ask("How much did the campaign cost?");
+
+    assert.equal(result.answer, "The campaign cost Rs.6000.");
+  });
+
+  it("askStream stops a looping Tanglish answer and sends the trimmed text as a replacement", async () => {
+    const loop = ["Sakthi a DOER, ayan irukkenga.", " Book writer yaru, ayan irukkenga.", " Sakthi, ayan irukkenga.", " More, ayan irukkenga.", " never sent"];
+    const client = createStreamingMockClient({ chunks: loop });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({
+          chunks: [{ ...chunk(12, 0.92), pageContent: "Zero Rupee Marketing means marketing on no budget." }],
+          timings: { embedMs: 1, searchMs: 2 },
+        }),
+      },
+      getClient: () => client,
+      logger: createTestLogger(),
+    });
+
+    const deltas = [];
+    const replacements = [];
+    const result = await service.askStream("Zero Rupee Marketing na enna?", {}, {
+      onDelta: (d) => deltas.push(d),
+      onReplace: (a) => replacements.push(a),
+    });
+
+    assert.ok(!deltas.includes(" never sent"), "generation stops once the loop is detected");
+    assert.deepEqual(replacements, ["Sakthi a DOER, ayan irukkenga."]);
+    assert.equal(result.answer, "Sakthi a DOER, ayan irukkenga.");
+  });
+});
+
+describe("author-identity answer shape", () => {
+  it("caps the output, asks for one sentence and drops an unasked second paragraph", async () => {
+    const openai = createMockOpenAI({ answer: "Indha book-oda writer John Doe.\n\nAvaru amma & appa ezhuthi." });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({
+          chunks: [{ ...chunk(0, 0.5), pageContent: "Author: John Doe" }],
+          timings: { embedMs: 1, searchMs: 2 },
+        }),
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+
+    const result = await service.ask("intha book writer yaru");
+
+    assert.equal(result.answer, "Indha book-oda writer John Doe.");
+    assert.equal(openai.calls.chat[0].max_tokens, 40);
+    assert.match(openai.calls.chat[0].messages.at(-1).content, /Indha book-oda writer <name>/);
+  });
+});
+
+describe("interrupted streams", () => {
+  it("fails, rather than returning a half answer, when the stream ends without a finish_reason", async () => {
+    const client = createStreamingMockClient({ chunks: ["According to Sakthi, starting a business is about taking that"], finished: false });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({ chunks: [chunk(12, 0.92)], timings: { embedMs: 1, searchMs: 2 } }),
+      },
+      getClient: () => client,
+      logger: createTestLogger(),
+    });
+
+    await assert.rejects(() => service.askStream("q"), /cut off/);
+  });
+});
+
+describe("off-topic Tanglish questions", () => {
+  it("declines without a model call when no retrieved chunk mentions the translated subject", async () => {
+    const openai = createMockOpenAI();
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({
+          chunks: [{ ...chunk(7, 0.53), pageContent: "This book is about guerrilla marketing." }],
+          timings: { embedMs: 1, searchMs: 2 },
+        }),
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+
+    const result = await service.ask("Pizza dough epdi pannanum?");
+
+    assert.equal(result.answer, NO_ANSWER_REPLIES.tanglish);
+    assert.equal(openai.calls.chat.length, 0);
+  });
+
+  it("answers when a retrieved chunk does mention it", async () => {
+    const openai = createMockOpenAI({ answer: "Business start panna risk edukkanum." });
+    const service = createChatService({
+      retrievalService: {
+        retrieve: async () => ({
+          chunks: [{ ...chunk(5, 0.6), pageContent: "Starting a business takes the ability to take risk." }],
+          timings: { embedMs: 1, searchMs: 2 },
+        }),
+      },
+      getClient: () => openai,
+      logger: createTestLogger(),
+    });
+
+    const result = await service.ask("business start panna enna mindset venum?");
+
+    assert.equal(openai.calls.chat.length, 1);
+    assert.equal(result.citations.length, 1);
   });
 });

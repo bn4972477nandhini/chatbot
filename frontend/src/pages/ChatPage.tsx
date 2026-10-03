@@ -28,7 +28,8 @@ export function ChatPage() {
   const hasMessages = messages.length > 0;
   // The streaming assistant bubble already shows progress once it exists —
   // showing the typing dots underneath it too would be redundant. Only show
-  // them during the gap before the first citations/token callback arrives.
+  // them until the first token creates that bubble (useChat holds citations
+  // back until then).
   const isStreamingReply = isLoading && messages[messages.length - 1]?.role === "assistant";
 
   return (

@@ -13,6 +13,11 @@ const { chunkText } = require("./services/chunkService");
 const { indexBook: defaultIndexBook, BOOK_PATH } = require("./services/indexService");
 const { createChatService } = require("./services/chatService");
 const { pingQdrant } = require("./services/qdrantService");
+const { MAX_HISTORY_MESSAGES } = require("./services/followUpService");
+
+// An answer is at most CHAT_MAX_OUTPUT_TOKENS long; this is generous for that
+// while keeping a full history well inside MAX_BODY_BYTES.
+const MAX_HISTORY_CONTENT_LENGTH = 2000;
 
 /**
  * Validates the /chat request body.
@@ -76,7 +81,32 @@ function parseChatBody(body) {
     stream = body.stream;
   }
 
-  return { question: question.trim(), options, stream };
+  // Earlier turns, for follow-up questions ("why is it useful?"). Optional,
+  // and never part of retrieval `options`. chatService decides whether the
+  // question needs them at all (services/followUpService.js).
+  const history = [];
+  if (body.history !== undefined) {
+    if (!Array.isArray(body.history) || body.history.length > MAX_HISTORY_MESSAGES) {
+      throw badRequest(`'history' must be an array of at most ${MAX_HISTORY_MESSAGES} messages.`);
+    }
+    for (const turn of body.history) {
+      const valid =
+        typeof turn === "object" &&
+        turn !== null &&
+        (turn.role === "user" || turn.role === "assistant") &&
+        typeof turn.content === "string" &&
+        turn.content.trim() !== "" &&
+        turn.content.length <= MAX_HISTORY_CONTENT_LENGTH;
+      if (!valid) {
+        throw badRequest(
+          `Each 'history' message needs a role of "user" or "assistant" and non-empty content of at most ${MAX_HISTORY_CONTENT_LENGTH} characters.`
+        );
+      }
+      history.push({ role: turn.role, content: turn.content.trim() });
+    }
+  }
+
+  return { question: question.trim(), options, stream, history };
 }
 
 /**
@@ -201,11 +231,12 @@ function createApp({
 
   app.post("/chat", chatLimiter, async (req, res, next) => {
     try {
-      const { question, options, stream } = parseChatBody(req.body);
+      const { question, options, stream, history } = parseChatBody(req.body);
 
       if (!stream) {
         const { answer, citations } = await chatService.ask(question, options, {
           logger: req.log,
+          history,
         });
 
         res.json({ answer, citations });
@@ -253,12 +284,19 @@ function createApp({
         await chatService.askStream(question, options, {
           logger: req.log,
           signal: abortController.signal,
+          history,
           onCitations: (citations) => send("citations", { citations }),
           onDelta: (delta) => send("token", { delta }),
+          // The answer checks changed what was streamed (loop cut, or an
+          // unsupported figure replaced): the client shows this text instead.
+          onReplace: (answer) => send("answer", { answer }),
         });
         send("done", {});
       } catch (error) {
-        if (error instanceof AppError && error.expose) {
+        if (abortController.signal.aborted) {
+          // The client left, so nothing failed and nobody is listening.
+          req.log.info("chat stream cancelled by client");
+        } else if (error instanceof AppError && error.expose) {
           req.log[error.status >= 500 ? "error" : "warn"]("request failed", {
             status: error.status,
             code: error.code,

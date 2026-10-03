@@ -7,6 +7,7 @@ const { AppError, configError, upstreamError } = require("../lib/errors");
 const DISTANCE = "Cosine";
 
 const UPSERT_BATCH_SIZE = 256;
+const SEARCH_RETRY_DELAY_MS = 200;
 
 let client = null;
 
@@ -165,8 +166,8 @@ function createQdrantService({
       });
     }
 
-    try {
-      const { points } = await getClient().query(collection, {
+    const query = () =>
+      getClient().query(collection, {
         query: vector,
         limit,
         score_threshold: scoreThreshold,
@@ -175,7 +176,21 @@ function createQdrantService({
         filter,
       });
 
-      return points ?? [];
+    try {
+      let response;
+      try {
+        response = await query();
+      } catch (error) {
+        // A search is a read, so repeating it is safe. One retry covers a
+        // dropped connection ("fetch failed", no HTTP status), which was seen
+        // failing a whole /chat with a 502. An HTTP error is a real answer
+        // from Qdrant and is not retried.
+        if (error?.status != null) throw error;
+        await new Promise((resolve) => setTimeout(resolve, SEARCH_RETRY_DELAY_MS));
+        response = await query();
+      }
+
+      return response.points ?? [];
     } catch (error) {
       // A 404 here means /index-book has not been run against this collection.
       if (error?.status === 404) {

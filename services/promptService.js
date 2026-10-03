@@ -74,6 +74,55 @@ Context handling:
 // the exact wording the system prompt promises.
 const NO_ANSWER_REPLY = "I couldn't find that information in the Founder Book.";
 
+// The same fallback for a question asked in (or asking for) Tanglish/Tamil.
+const NO_ANSWER_REPLIES = Object.freeze({
+  english: NO_ANSWER_REPLY,
+  tanglish: "Indha information book content-la enakku kidaikkala, so accurate-a answer panna mudiyala.",
+  tamil: "மன்னிக்கவும், இந்தத் தகவல் Founder Book-இல் இல்லை.",
+});
+
+function noAnswerReply(language) {
+  return NO_ANSWER_REPLIES[language] ?? NO_ANSWER_REPLY;
+}
+
+/** True when the model's reply is (only) one of the fallback sentences. */
+function isNoAnswerReply(answer) {
+  const normalise = (text) =>
+    text.trim().replace(/^['"“]+|['"”]+$/g, "").replace(/\s+/g, " ").toLowerCase();
+  const reply = normalise(answer ?? "");
+  return Object.values(NO_ANSWER_REPLIES).some((fallback) => reply === normalise(fallback));
+}
+
+// Appended after the question, never in the system prompt, so the system
+// prompt stays byte-identical across requests and Ollama can reuse its prefill.
+const LANGUAGE_INSTRUCTIONS = Object.freeze({
+  english: "Answer language: English.",
+  // Measured on llama3.2 3B. A long instruction with an on-topic example made
+  // it copy the example or loop ("aiyappan, aiyappan!"); a few-shot Tanglish
+  // exchange, and a second "rewrite this in Tanglish" call, both produced
+  // Tanglish that stated things the book does not. Short answers with
+  // placeholder-only examples gave clean replies ("Indha book-oda writer
+  // <name>."). Longer, open-ended Tanglish answers are still weak on 3B.
+  // Facts in simple English, joined with common Tamil words. Compared on the
+  // same retrieved passages, a mostly-Tamil instruction gave "IIT fest
+  // campaign ku evlo selavu aachu, festival na, brand integrate pannanam" (no
+  // figure); this one gave "Rs.6000 spent, 20K reach pannanga, Orders worth
+  // 35K irukku". Author questions use their own fill-in form (intentService).
+  tanglish:
+    "Answer language: casual Tanglish. Answer the question in 2 or 3 short sentences. Write the facts in simple English " +
+    "and join them with a few common Tamil words in English letters (like na, dhaan, romba, irukku, pannanga), the way people in Chennai chat. " +
+    "Do not repeat the question. Give names, numbers and amounts exactly as the context states them. No Tamil script. " +
+    `If the context has nothing relevant, reply with ONLY: '${NO_ANSWER_REPLIES.tanglish}'`,
+  tamil:
+    "Answer language: Tamil, in Tamil script. Keep names and technical terms in English. " +
+    `If the context has nothing relevant, reply with ONLY: '${NO_ANSWER_REPLIES.tamil}'`,
+});
+
+// Added only when earlier turns are in the prompt (follow-up questions).
+const FOLLOW_UP_INSTRUCTION =
+  "The earlier messages only show what this question refers to. Answer it from the context above, " +
+  "not from those earlier answers.";
+
 const CONTEXT_START = "<<<CONTEXT_START>>>";
 const CONTEXT_END = "<<<CONTEXT_END>>>";
 
@@ -153,9 +202,43 @@ function sanitiseText(value) {
  * that add nothing the citations array doesn't already carry — the shorter
  * label shortens that echo too, when it still happens.
  */
+// Neighbouring chunks share CHUNK_OVERLAP characters of identical text. When
+// both are in the context that text would be read twice, at ~43 ms a token
+// on CPU. Shorter matches are ignored as coincidence.
+const MIN_OVERLAP_CHARS = 30;
+const MAX_OVERLAP_CHARS = config.chunking.chunkOverlap;
+
+/** Length of the longest prefix of `next` that `previous` ends with. */
+function overlapLength(previous, next) {
+  const max = Math.min(previous.length, next.length, MAX_OVERLAP_CHARS);
+  for (let length = max; length >= MIN_OVERLAP_CHARS; length--) {
+    if (previous.endsWith(next.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+/**
+ * Each chunk's text, minus any opening text that repeats the end of the
+ * previous chunk (chunkId - 1) when that chunk is in the context too.
+ * Nothing is lost: the repeated text is still there, in the other excerpt.
+ */
+function withoutRepeatedOverlap(chunks) {
+  const textById = new Map(chunks.map((chunk) => [chunk.chunkId, chunk.pageContent ?? ""]));
+
+  return chunks.map((chunk) => {
+    const text = chunk.pageContent ?? "";
+    const previous = typeof chunk.chunkId === "number" ? textById.get(chunk.chunkId - 1) : undefined;
+    if (previous === undefined) return text;
+
+    const length = overlapLength(previous, text);
+    return length > 0 ? text.slice(length).trimStart() || text : text;
+  });
+}
+
 function formatContext(chunks) {
   if (!chunks || chunks.length === 0) return "(no relevant context found)";
 
+  const texts = withoutRepeatedOverlap(chunks);
   const parts = new Array(chunks.length);
 
   for (let index = 0; index < chunks.length; index++) {
@@ -166,7 +249,7 @@ function formatContext(chunks) {
         : chunk.pageEnd != null && chunk.pageEnd !== chunk.page
           ? `[Excerpt from pages ${chunk.page}-${chunk.pageEnd}]`
           : `[Excerpt from page ${chunk.page}]`;
-    parts[index] = `${label}\n` + sanitiseText(chunk.pageContent);
+    parts[index] = `${label}\n` + sanitiseText(texts[index]);
   }
 
   return parts.join("\n\n---\n\n");
@@ -178,21 +261,58 @@ function formatContext(chunks) {
  * @param {object} params
  * @param {string} params.question
  * @param {Array<{chunkId: number, pageContent: string, source: string}>} params.chunks
+ * @param {Array<{role: "user"|"assistant", content: string}>} [params.history]
+ *   earlier turns, placed between the system prompt and this question so the
+ *   system prompt stays the cached prefix
+ * @param {string} [params.language] "english" (default), "tanglish" or "tamil"
+ * @param {string} [params.answerInstruction] a recognised intent's answer
+ *   shape, already in the answer language (intentService.js). It replaces the
+ *   general language instruction, which would contradict it (e.g. "one
+ *   sentence" vs "two or three sentences"); the localised fallback stays.
+ * @param {boolean} [params.explicitLanguage] the user named the language
+ *   outright; an English request then gets an explicit instruction too
  * @returns {Array<{role: string, content: string}>}
  */
-function buildMessages({ question, chunks }) {
+function buildMessages({
+  question,
+  chunks,
+  history = [],
+  language = "english",
+  explicitLanguage = false,
+  answerInstruction,
+}) {
   if (typeof question !== "string" || question.trim() === "") {
     throw new Error("buildMessages requires a non-empty question.");
   }
 
   const safeQuestion = sanitiseText(question).slice(0, config.limits.maxQuestionLength);
+  // With history in the prompt the model tends to answer in whatever language
+  // the previous answer used, so the language is then always stated.
+  const languageInstruction = answerInstruction
+    ? language !== "english"
+      ? `If the context has nothing relevant, reply with ONLY: '${noAnswerReply(language)}'`
+      : null
+    : language !== "english" || explicitLanguage || history.length > 0
+      ? LANGUAGE_INSTRUCTIONS[language]
+      : undefined;
+
+  const instructions = [
+    history.length > 0 ? FOLLOW_UP_INSTRUCTION : null,
+    answerInstruction,
+    languageInstruction,
+  ]
+    .filter(Boolean)
+    .map((instruction) => `\n\n${instruction}`)
+    .join("");
 
   const userContent =
     `Context:\n\n${CONTEXT_START}\n${formatContext(chunks)}\n${CONTEXT_END}\n\n` +
-    `User Question:\n\n${safeQuestion}`;
+    `User Question:\n\n${safeQuestion}` +
+    instructions;
 
   return [
     { role: "system", content: SYSTEM_PROMPT },
+    ...history.map((turn) => ({ role: turn.role, content: sanitiseText(turn.content) })),
     { role: "user", content: userContent },
   ];
 }
@@ -203,6 +323,9 @@ module.exports = {
   sanitiseText,
   SYSTEM_PROMPT,
   NO_ANSWER_REPLY,
+  NO_ANSWER_REPLIES,
+  noAnswerReply,
+  isNoAnswerReply,
   CONTEXT_START,
   CONTEXT_END,
 };

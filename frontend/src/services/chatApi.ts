@@ -1,4 +1,4 @@
-import type { ChatResponse, Citation } from "../types/chat";
+import type { ChatResponse, Citation, HistoryTurn } from "../types/chat";
 
 const CHAT_ENDPOINT = "/chat";
 // Local Ollama inference is slower than a hosted API — mirrors the backend's
@@ -104,7 +104,13 @@ export interface StreamCallbacks {
   onCitations?: (citations: Citation[]) => void;
   /** Fired for each answer fragment as the model generates it, in order. */
   onDelta?: (delta: string) => void;
+  /** Fired when the server corrected the streamed answer; the whole text replaces it. */
+  onReplace?: (answer: string) => void;
 }
+
+// The server caps each history turn at 2000 characters and rejects longer
+// ones, so anything past that is trimmed here rather than failing the request.
+const MAX_HISTORY_CONTENT_LENGTH = 2000;
 
 /** One `event: ...\ndata: ...` Server-Sent Events frame. */
 interface SSEFrame {
@@ -141,9 +147,13 @@ function parseSSEFrame(frame: string): SSEFrame | null {
 export async function streamQuestion(
   question: string,
   signal: AbortSignal | undefined,
-  callbacks: StreamCallbacks = {}
+  callbacks: StreamCallbacks = {},
+  history: HistoryTurn[] = []
 ): Promise<ChatResponse> {
   const trimmed = assertValidQuestion(question);
+  const trimmedHistory = history
+    .filter((turn) => turn.content.trim() !== "")
+    .map((turn) => ({ role: turn.role, content: turn.content.slice(0, MAX_HISTORY_CONTENT_LENGTH) }));
 
   // Combines the caller's signal with an internal timeout, so either can abort.
   const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -155,7 +165,11 @@ export async function streamQuestion(
     response = await fetch(CHAT_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: trimmed, stream: true }),
+      body: JSON.stringify({
+        question: trimmed,
+        stream: true,
+        ...(trimmedHistory.length > 0 ? { history: trimmedHistory } : {}),
+      }),
       signal: combinedSignal,
     });
   } catch (error) {
@@ -217,6 +231,12 @@ export async function streamQuestion(
           if (typeof delta === "string") {
             answer += delta;
             callbacks.onDelta?.(delta);
+          }
+        } else if (frame.event === "answer") {
+          const replacement = (frame.data as { answer?: unknown })?.answer;
+          if (typeof replacement === "string") {
+            answer = replacement;
+            callbacks.onReplace?.(replacement);
           }
         } else if (frame.event === "error") {
           const message = (frame.data as { message?: unknown })?.message;

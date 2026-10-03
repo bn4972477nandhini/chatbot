@@ -132,3 +132,34 @@ describe("qdrantService.searchPoints", () => {
     );
   });
 });
+
+describe("qdrantService.searchPoints retry", () => {
+  it("retries once after a dropped connection", async () => {
+    const client = createMockQdrant();
+    let calls = 0;
+    client.query = async () => {
+      calls++;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return { points: [{ id: 1, score: 0.9, payload: { chunkId: 1 } }] };
+    };
+    const service = createQdrantService({ getClient: () => client, collection: COLLECTION });
+
+    const points = await service.searchPoints(fakeVector("q"), { limit: 1 });
+
+    assert.equal(calls, 2);
+    assert.equal(points.length, 1);
+  });
+
+  it("does not retry an HTTP error from Qdrant", async () => {
+    const client = createMockQdrant();
+    let calls = 0;
+    client.query = async () => {
+      calls++;
+      throw Object.assign(new Error("Bad request"), { status: 400 });
+    };
+    const service = createQdrantService({ getClient: () => client, collection: COLLECTION });
+
+    await assert.rejects(() => service.searchPoints(fakeVector("q"), { limit: 1 }), /Qdrant search failed/);
+    assert.equal(calls, 1);
+  });
+});
